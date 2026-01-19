@@ -1,0 +1,21 @@
+Private state
+
+These should not be directly modified from outside.
+
+double cash
+
+double shares
+
+enum PositionState { IN_CASH, IN_POSITION }
+
+Public behavior
+
+These are the only legal interactions.
+
+buy(double price)
+
+sell(double price)
+
+double value(double price) const
+
+bool in_position() const
