@@ -1,21 +1,106 @@
-Private state
+json fetch_data(std::string ticker) {
+		std::string function{ "TIME_SERIES_DAILY" };
+		std::string API_KEY = "78K9C0K0JIKZFLXB";
+		std::string url = "https://www.alphavantage.co/query?function=";
+		std::string endpoint = url + function + "&symbol=" + ticker + "&apikey=" + API_KEY;
+		cpr::Response r = cpr::Get(cpr::Url(endpoint));
+		json data = json::parse(r.text);
+		std::ofstream save(ticker + ".json");
+		save << data.dump(4);
+		return data;
+	}
 
-These should not be directly modified from outside.
+	json load_json_if_exists(std::string ticker) {
+		namespace fs = std::filesystem;
+		std::string filename = ticker + ".json";
+		if (fs::exists(filename)) {
+			std::ifstream file(filename);
+			if (!file.is_open()) {
+				throw std::runtime_error("File exists but cannot be opened: " + filename);
+			}
 
-double cash
+			json j;
+			file >> j;
+			return j;
+		}
+		else
+		{
+			return fetch_data(ticker);
+		}
+	}
 
-double shares
+	bool verify_true(const std::vector<Day>& time_series) {
+		for (size_t i = 0; i + 1 < time_series.size(); i++) {
+			if (time_series[i].date > time_series[i + 1].date)
+				return false;
+		}
+		return true;
+	}
 
-enum PositionState { IN_CASH, IN_POSITION }
+	void init_time_series(std::string ticker) {
+		json data = load_json_if_exists(ticker);
+		std::string last_refresh = data.at("Meta Data").at("3. Last Refreshed").get<std::string>();
+		std::cout << "Latest date: " << last_refresh << std::endl;
 
-Public behavior
+		json daily = data.at("Time Series (Daily)");
 
-These are the only legal interactions.
 
-buy(double price)
+		for (auto it = daily.begin(); it != daily.end(); ++it) {
+			std::string date = it.key();
+			json daily_data = it.value();
 
-sell(double price)
+			double close = std::stod(daily_data.at("4. close").get<std::string>());
 
-double value(double price) const
+			time_series.push_back(Day(date, close));
+			//std::cout << date << " -> " << close << std::endl;
+		}
+		std::sort(time_series.begin(), time_series.end(),
+			[](const Day& a, const Day& b) {
+				return a.date < b.date;
+			});
+		if (!verify_true(time_series))
+		{
+			exit(1);
+		}
+	}
 
-bool in_position() const
+
+	
+	json load_json(std::string ticker) {
+	}
+public:
+	Backtest(std::string ticker, int opt) { 
+		std::string ticker{};
+		if(opt==1) {
+			ticker = "AAPL";
+
+		}
+		else
+			init_time_series(ticker); }
+	void run_backtest(Portfolio& p) {
+		Signal signal{};
+		double price{};
+		for (size_t i = 2; i < time_series.size(); i++) {
+			signal = generate_signal(time_series, i - 1);
+			price = time_series[i].close;
+
+			if (signal == Signal::BUY && !p.in_position()) {
+				p.buy(price);
+				//std::cout << "BUY @" << price << std::endl;
+			}
+			if (signal == Signal::SELL && p.in_position()) {
+				p.sell(price);
+				//std::cout << "SELL @" << price << std::endl;
+			}
+			equity_curve.push_back(p.value(price));
+		}
+	}
+	void print_equity_curve() {
+		for (const auto& x : equity_curve) {
+			std::cout << x << std::endl;
+		}
+	}
+	const std::vector<double>& get_equity_curve() const {
+		return this->equity_curve;
+	}
+};

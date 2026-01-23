@@ -8,6 +8,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <algorithm>
+
 using json = nlohmann::json;
 using response = cpr::Response;
 
@@ -24,6 +25,11 @@ enum class Signal {
 	BUY,
 	SELL,
 	HOLD
+};
+enum class Regimes {
+	STRESS,
+	EASY,
+	MODERN
 };
 Signal generate_signal(const std::vector<Day>& time_series, size_t i) {
 	if (i <= 1)
@@ -99,19 +105,8 @@ class Backtest {
 private:
 	std::vector<Day> time_series;
 	std::vector<double> equity_curve;
-	json fetch_data(std::string ticker) {
-		std::string function{ "TIME_SERIES_DAILY" };
-		std::string API_KEY = "78K9C0K0JIKZFLXB";
-		std::string url = "https://www.alphavantage.co/query?function=";
-		std::string endpoint = url + function + "&symbol=" + ticker + "&apikey=" + API_KEY;
-		cpr::Response r = cpr::Get(cpr::Url(endpoint));
-		json data = json::parse(r.text);
-		std::ofstream save(ticker + ".json");
-		save << data.dump(4);
-		return data;
-	}
-
-	json load_json_if_exists(std::string ticker) {
+	
+	json load_json(std::string ticker) {
 		namespace fs = std::filesystem;
 		std::string filename = ticker + ".json";
 		if (fs::exists(filename)) {
@@ -126,9 +121,10 @@ private:
 		}
 		else
 		{
-			return fetch_data(ticker);
+			throw std::runtime_error("JSON not found: " + filename);
 		}
 	}
+	
 
 	bool verify_true(const std::vector<Day>& time_series) {
 		for (size_t i = 0; i + 1 < time_series.size(); i++) {
@@ -139,21 +135,23 @@ private:
 	}
 
 	void init_time_series(std::string ticker) {
-		json data = load_json_if_exists(ticker);
-		std::string last_refresh = data.at("Meta Data").at("3. Last Refreshed").get<std::string>();
-		std::cout << "Latest date: " << last_refresh << std::endl;
+		json data = load_json(ticker);
+		std::string last_refresh{};
 
-		json daily = data.at("Time Series (Daily)");
+		if (!data.is_array()) {
+			throw std::runtime_error("Expected JSON array at root");
+		}
+
+		time_series.reserve(data.size());
 
 
-		for (auto it = daily.begin(); it != daily.end(); ++it) {
-			std::string date = it.key();
-			json daily_data = it.value();
+		for (const auto& row : data) {
+			std::string full_date = row.at("Date").get<std::string>();
+			std::string date = full_date.substr(0, 10);
 
-			double close = std::stod(daily_data.at("4. close").get<std::string>());
+			double close = row.at("Close").get<double>();
 
-			time_series.push_back(Day(date, close));
-			//std::cout << date << " -> " << close << std::endl;
+			time_series.emplace_back(date, close);
 		}
 		std::sort(time_series.begin(), time_series.end(),
 			[](const Day& a, const Day& b) {
@@ -164,12 +162,24 @@ private:
 			exit(1);
 		}
 	}
+	bool in_regime(const std::string& date, Regimes regime) {
+		if (regime == Regimes::STRESS) {
+			return date >= "2000-01-01" && date <= "2009-12-31";
+		}
+		if (regime == Regimes::EASY) {
+			return date >= "2010-01-01" && date <= "2019-12-31";
+		}
+		return date >= "2020-01-01" && date <= "2025-12-31";
+	}
 public:
-	Backtest(std::string ticker) { init_time_series(ticker); }
-	void run_backtest(Portfolio& p) {
+	Backtest(std::string ticker, int opt) { init_time_series(ticker); }
+	void run_backtest(Portfolio& p, Regimes regime) {
 		Signal signal{};
 		double price{};
 		for (size_t i = 2; i < time_series.size(); i++) {
+			if (!in_regime(time_series[i].date, regime))     continue;
+			if (!in_regime(time_series[i - 1].date, regime)) continue;
+			if (!in_regime(time_series[i - 2].date, regime)) continue;
 			signal = generate_signal(time_series, i - 1);
 			price = time_series[i].close;
 
@@ -191,6 +201,9 @@ public:
 	}
 	const std::vector<double>& get_equity_curve() const {
 		return this->equity_curve;
+	}
+	void clear() {
+		equity_curve.clear();
 	}
 };
 
@@ -262,6 +275,20 @@ private:
 
 		sharpe = (mean / std) * std::sqrt(252.0);
 	}
+	void saveVector(const std::vector<double>& v) {
+		std::ofstream file("equity.dat");
+		for (size_t i = 0; i < v.size(); ++i)
+			file << i << " " << v[i] << "\n";
+		file.close();
+		system(
+			"gnuplot -persist -e \""
+			"set title 'Equity Curve';"
+			"set xlabel 'Trade Number';"
+			"set ylabel 'Account Value';"
+			"set grid;"
+			"plot 'equity.dat' using 1:2 with lines lw 2 title 'Equity'\""
+		);
+	}
 public:
 	Metrics(const std::vector<double>& equity_curve) {
 		calc_daily_returns(equity_curve);
@@ -273,45 +300,60 @@ public:
 	double max_drawdown() const { return this->drawdown; }
 	const std::vector<double>& daily_returns() const { return this->returns; }
 	double get_sharpe() const { return this->sharpe; }
-
+	void print_metrics(const std::vector<double>& equity_curve) {
+		auto drawdown = max_drawdown();
+		std::cout << "MAX DRAWDOWN:" << drawdown << std::endl;
+		auto cagr = getCAGR();
+		std::cout << "CAGR:" << cagr << std::endl;
+		auto sharpe = get_sharpe();
+		std::cout << "SHARPE: " << sharpe << std::endl;
+		saveVector(equity_curve);
+	}
 	
 };
 
 
-void saveVector(const std::vector<double>& v) {
-	std::ofstream file("equity.dat");
-	for (size_t i = 0; i < v.size(); ++i)
-		file << i << " " << v[i] << "\n";
-	file.close();
-	system(
-		"gnuplot -persist -e \""
-		"set title 'Equity Curve';"
-		"set xlabel 'Trade Number';"
-		"set ylabel 'Account Value';"
-		"set grid;"
-		"plot 'equity.dat' using 1:2 with lines lw 2 title 'Equity'\""
-	);
-}
+
 
 int main() {
+	int opt = 1;
+	int reg = 3;
+	Regimes regime{Regimes::MODERN};
+	/*
+	std::cout << "Select ticker:\n";
+	std::cout << "1. AAPL\n";
+	std::cout << "Custom Search(Limited to 100 trading days):\n";
+	std::cin >> opt;
 	
-	Portfolio p(10000);
-	Backtest b("SPY");
-	b.run_backtest(p);
-	//b.print_equity_curve();
-	Metrics m(b.get_equity_curve());
-	auto returns = m.daily_returns();
-	/*for (auto x : returns) {
-		std::cout << x << std::endl;
-	}*/
-	auto drawdown = m.max_drawdown();
-	std::cout << "MAX DRAWDOWN:" << drawdown << std::endl;
-	auto cagr = m.getCAGR();
-	std::cout << "CAGR:" << cagr << std::endl;
-	auto sharpe = m.get_sharpe();
-	std::cout << "SHARPE: " << sharpe << std::endl;
+	std::cout << "Select Regime:\n";
+	std::cout << "1: 2000–2009 stress test\n2: 2010–2019 easy regime\n3: 2020–2025 modern\n";
+	std::cin >> reg;
+	if(reg==1) regime = Regimes::STRESS;
+	if(reg==2) regime = Regimes::EASY;
+	if(reg==3) regime = Regimes::MODERN;
+	*/
 
-	saveVector(b.get_equity_curve());
+
+	Portfolio p1(10000);
+	Backtest b("AAPL", opt);
+	b.run_backtest(p1, Regimes::STRESS);
+	Metrics m1(b.get_equity_curve());
+	m1.print_metrics(b.get_equity_curve());
 	
+	
+	Portfolio p2(10000);
+	b.clear();
+	b.run_backtest(p2, Regimes::EASY);
+	Metrics m2(b.get_equity_curve());
+	m2.print_metrics(b.get_equity_curve());
+	
+
+	Portfolio p3(10000);
+	b.clear();
+	b.run_backtest(p3, Regimes::MODERN);
+	Metrics m3(b.get_equity_curve());
+	m3.print_metrics(b.get_equity_curve());
+	
+
 	return 0;
 }
