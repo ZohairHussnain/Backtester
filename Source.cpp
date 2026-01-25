@@ -8,6 +8,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <algorithm>
+#include <optional>
 
 using json = nlohmann::json;
 using response = cpr::Response;
@@ -31,20 +32,35 @@ enum class Regimes {
 	EASY,
 	MODERN
 };
-Signal generate_signal(const std::vector<Day>& time_series, size_t i) {
-	if (i <= 1)
-		return Signal::HOLD;
-	if (time_series[i - 1].close > time_series[i - 2].close)
-		return Signal::BUY;
-	else if (time_series[i - 1].close < time_series[i - 2].close)
-		return Signal::SELL;
-	return Signal::HOLD;
-}
+
+
+class Trade {
+public:
+	std::string entry_date;
+	std::string exit_date;
+
+	double entry_price;
+	double exit_price;
+
+	double shares;
+	double fees;
+
+	double pnl() const {
+		return (exit_price - entry_price) * shares - fees;
+	}
+
+	double return_pct() const {
+		return (exit_price - entry_price) / entry_price;
+	}
+};
+
 class Portfolio {
 private:
 	double cash;
 	double shares;
 	PositionState state;
+	std::optional<Trade> open_trade;
+	std::vector<Trade> closed_trades;
 	double slippage = 0.0005;
 	double calculate_transaction_costs(double price, double shares) const {
 		double trade_value = price * shares;
@@ -59,9 +75,9 @@ public:
 	Portfolio() : cash(10000), shares(0), state(PositionState::IN_CASH) {}
 	Portfolio(double cash) : cash(cash), shares(0), state(PositionState::IN_CASH) {}
 	bool in_position() const {
-		return state == PositionState::IN_POSITION;
+		return open_trade.has_value();
 	}
-	void buy(double price) {
+	void buy(double price, const std::string& date) {
 		if (this->state == PositionState::IN_POSITION || price <= 0)
 			return;
 		double execution_price = price * (1.0 + slippage);
@@ -79,11 +95,13 @@ public:
 		this->shares = investable_cash / execution_price;
 		this->cash = 0.0;
 		this->state = PositionState::IN_POSITION;
+
+		open_trade = Trade{ date, "", execution_price, 0.0, shares, fees };//aggregate init
 	}
-	void sell(double price) {
+	void sell(double price, const std::string& date) {
 		if (this->state == PositionState::IN_CASH || price <= 0)
 			return;
-
+		if (!open_trade) return;
 		double execution_price = price * (1.0 - slippage);
 
 		double value = shares * execution_price;
@@ -92,6 +110,13 @@ public:
 		this->cash = value - fees;
 		this->shares = 0.0;
 		this->state = PositionState::IN_CASH;
+
+		open_trade->exit_date = date;
+		open_trade->exit_price = execution_price;
+		open_trade->fees += fees;
+		
+		closed_trades.push_back(*open_trade);
+		open_trade.reset();
 	}
 	double value(double price) const {
 		if (this->state == PositionState::IN_CASH)
@@ -101,6 +126,34 @@ public:
 	}
 
 };
+
+class Strategy {
+public:
+	virtual Signal generate(const std::vector<Day>& time_series, size_t i) const = 0;
+	virtual ~Strategy() = default;
+};
+class MomentumStrategy : public Strategy {
+private:
+	size_t lookback;
+
+public:
+	explicit MomentumStrategy(size_t lookback = 20)
+		: lookback(lookback) {
+	}
+
+	Signal generate(const std::vector<Day>& time_series, size_t i) const override {
+		if (i < lookback)
+			return Signal::HOLD;
+
+		double now = time_series[i - 1].close;
+		double past = time_series[i - lookback].close;
+
+		if (now > past) return Signal::BUY;
+		if (now < past) return Signal::SELL;
+		return Signal::HOLD;
+	}
+};
+
 class Backtest {
 private:
 	std::vector<Day> time_series;
@@ -173,22 +226,22 @@ private:
 	}
 public:
 	Backtest(std::string ticker, int opt) { init_time_series(ticker); }
-	void run_backtest(Portfolio& p, Regimes regime) {
+	void run_backtest(Portfolio& p, const Strategy& s, Regimes regime) {
 		Signal signal{};
 		double price{};
 		for (size_t i = 2; i < time_series.size(); i++) {
 			if (!in_regime(time_series[i].date, regime))     continue;
 			if (!in_regime(time_series[i - 1].date, regime)) continue;
 			if (!in_regime(time_series[i - 2].date, regime)) continue;
-			signal = generate_signal(time_series, i - 1);
+			signal = s.generate(time_series, i - 1);
 			price = time_series[i].close;
 
 			if (signal == Signal::BUY && !p.in_position()) {
-				p.buy(price);
+				p.buy(price, time_series[i].date);
 				//std::cout << "BUY @" << price << std::endl;
 			}
 			if (signal == Signal::SELL && p.in_position()) {
-				p.sell(price);
+				p.sell(price, time_series[i].date);
 				//std::cout << "SELL @" << price << std::endl;
 			}
 			equity_curve.push_back(p.value(price));
@@ -335,22 +388,23 @@ int main() {
 
 
 	Portfolio p1(10000);
+	MomentumStrategy strat(20);
 	Backtest b("AAPL", opt);
-	b.run_backtest(p1, Regimes::STRESS);
+	b.run_backtest(p1,strat, Regimes::STRESS);
 	Metrics m1(b.get_equity_curve());
 	m1.print_metrics(b.get_equity_curve());
 	
 	
 	Portfolio p2(10000);
 	b.clear();
-	b.run_backtest(p2, Regimes::EASY);
+	b.run_backtest(p2,strat, Regimes::EASY);
 	Metrics m2(b.get_equity_curve());
 	m2.print_metrics(b.get_equity_curve());
 	
 
 	Portfolio p3(10000);
 	b.clear();
-	b.run_backtest(p3, Regimes::MODERN);
+	b.run_backtest(p3,strat, Regimes::MODERN);
 	Metrics m3(b.get_equity_curve());
 	m3.print_metrics(b.get_equity_curve());
 	
