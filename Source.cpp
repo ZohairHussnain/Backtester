@@ -32,23 +32,18 @@ enum class Regimes {
 	EASY,
 	MODERN
 };
-
-
 class Trade {
 public:
 	std::string entry_date;
 	std::string exit_date;
-
 	double entry_price;
 	double exit_price;
-
 	double shares;
 	double fees;
 
 	double pnl() const {
 		return (exit_price - entry_price) * shares - fees;
 	}
-
 	double return_pct() const {
 		return (exit_price - entry_price) / entry_price;
 	}
@@ -70,7 +65,6 @@ private:
 		commission = std::min(commission, 0.01 * trade_value); //max cost 1%
 		return commission;
 	}
-
 public:
 	Portfolio() : cash(10000), shares(0), state(PositionState::IN_CASH) {}
 	Portfolio(double cash) : cash(cash), shares(0), state(PositionState::IN_CASH) {}
@@ -124,7 +118,9 @@ public:
 		else
 			return this->shares * price;
 	}
-
+	const std::vector<Trade>& get_trades() const {
+		return closed_trades;
+	}
 };
 
 class Strategy {
@@ -135,12 +131,10 @@ public:
 class MomentumStrategy : public Strategy {
 private:
 	size_t lookback;
-
 public:
 	explicit MomentumStrategy(size_t lookback = 20)
 		: lookback(lookback) {
 	}
-
 	Signal generate(const std::vector<Day>& time_series, size_t i) const override {
 		if (i < lookback)
 			return Signal::HOLD;
@@ -177,8 +171,6 @@ private:
 			throw std::runtime_error("JSON not found: " + filename);
 		}
 	}
-	
-
 	bool verify_true(const std::vector<Day>& time_series) {
 		for (size_t i = 0; i + 1 < time_series.size(); i++) {
 			if (time_series[i].date > time_series[i + 1].date)
@@ -186,7 +178,6 @@ private:
 		}
 		return true;
 	}
-
 	void init_time_series(std::string ticker) {
 		json data = load_json(ticker);
 		std::string last_refresh{};
@@ -304,7 +295,6 @@ private:
 
 		CAGR = std::pow(final / initial, 1.0 / years) - 1.0;
 	}
-
 	void calc_sharpe() {
 		if (returns.size() < 2) {
 			sharpe = 0.0;
@@ -362,11 +352,56 @@ public:
 		std::cout << "SHARPE: " << sharpe << std::endl;
 		saveVector(equity_curve);
 	}
-	
 };
 
+class TradeMetrics {
+public:
+	static void print(const std::vector<Trade>& trades) {
+		if (trades.empty()) {
+			std::cout << "No trades executed";
+			return;
+		}
 
+		int wins{ 0 };
+		int losses{ 0 };
 
+		double total_pnl{ 0.0 };
+		double total_win{ 0.0 };
+		double total_loss{ 0.0 };
+		double total_fees{ 0.0 };
+
+		for (const auto& t : trades) {
+			double pnl = t.pnl();
+			total_pnl += pnl;
+			total_fees += t.fees;
+
+			if (pnl > 0) {
+				wins++;
+				total_win += pnl;
+			}
+			else {
+				losses++;
+				total_loss += -pnl;
+			}
+		}
+
+		int total_trades{ wins + losses };
+
+		double win_rate = static_cast<double>(wins) / total_trades;
+		double avg_pnl = total_pnl / total_trades;
+		double avg_win = wins > 0 ? total_win / total_trades : 0.0;
+		double avg_loss = losses > 0 ? total_loss / total_trades : 0.0;
+		double profit_factor = total_win > 0 ? total_win / total_loss : 0.0;
+
+		std::cout << "TRADES: " << total_trades << "\n";
+		std::cout << "WIN RATE: " << win_rate * 100 << "%\n";
+		std::cout << "AVG TRADE PNL: " << avg_pnl << "\n";
+		std::cout << "AVG WIN: " << avg_win << "\n";
+		std::cout << "AVG LOSS: " << avg_loss << "\n";
+		std::cout << "PROFIT FACTOR: " << profit_factor << "\n";
+		std::cout << "TOTAL FEES: " << total_fees << "\n";
+	}
+};
 
 int main() {
 	int opt = 1;
@@ -407,6 +442,7 @@ int main() {
 	b.run_backtest(p3,strat, Regimes::MODERN);
 	Metrics m3(b.get_equity_curve());
 	m3.print_metrics(b.get_equity_curve());
+	TradeMetrics::print(p3.get_trades());
 	
 
 	return 0;
