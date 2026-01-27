@@ -389,9 +389,11 @@ public:
 
 		double win_rate = static_cast<double>(wins) / total_trades;
 		double avg_pnl = total_pnl / total_trades;
-		double avg_win = wins > 0 ? total_win / total_trades : 0.0;
-		double avg_loss = losses > 0 ? total_loss / total_trades : 0.0;
+		double avg_win = wins > 0 ? total_win / wins : 0.0;
+		double avg_loss = losses > 0 ? total_loss / losses : 0.0;
 		double profit_factor = total_win > 0 ? total_win / total_loss : 0.0;
+
+		double expectancy = win_rate * avg_win - (1 - win_rate) * avg_loss;//not sure of this
 
 		std::cout << "TRADES: " << total_trades << "\n";
 		std::cout << "WIN RATE: " << win_rate * 100 << "%\n";

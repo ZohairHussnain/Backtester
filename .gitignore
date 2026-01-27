@@ -1,0 +1,11 @@
+# Visual Studio generated files
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# Build output
+build/
+x64/
+out/
