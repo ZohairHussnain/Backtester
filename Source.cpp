@@ -9,6 +9,9 @@
 #include <stdexcept>
 #include <algorithm>
 #include <optional>
+#include <cmath>
+#include <numeric>
+#include <limits>
 
 using json = nlohmann::json;
 using response = cpr::Response;
@@ -53,7 +56,6 @@ class Portfolio {
 private:
 	double cash;
 	double shares;
-	PositionState state;
 	std::optional<Trade> open_trade;
 	std::vector<Trade> closed_trades;
 	double slippage = 0.0005;
@@ -66,36 +68,41 @@ private:
 		return commission;
 	}
 public:
-	Portfolio() : cash(10000), shares(0), state(PositionState::IN_CASH) {}
-	Portfolio(double cash) : cash(cash), shares(0), state(PositionState::IN_CASH) {}
+	Portfolio() : cash(10000), shares(0) {}
+	Portfolio(double cash) : cash(cash), shares(0) {}
 	bool in_position() const {
 		return open_trade.has_value();
 	}
 	void buy(double price, const std::string& date) {
-		if (this->state == PositionState::IN_POSITION || price <= 0)
+		if (in_position() || price <= 0)
 			return;
 		double execution_price = price * (1.0 + slippage);
 
-		double tentative_shares = cash / execution_price;
-		double fees = calculate_transaction_costs(execution_price, tentative_shares);
+		double sh = cash / execution_price; //first guess of shares
+		double fees = calculate_transaction_costs(execution_price, sh);
 
 		double investable_cash = cash - fees;
 
 		if (investable_cash <= 0)
 			return;
 
-		
+		sh = investable_cash / execution_price;
+		fees = calculate_transaction_costs(execution_price, sh);
+		investable_cash = cash - fees;
 
-		this->shares = investable_cash / execution_price;
+		if (investable_cash <= 0)
+			return;
+
+		sh = investable_cash / execution_price;
+		this->shares = sh;
 		this->cash = 0.0;
-		this->state = PositionState::IN_POSITION;
+		
 
 		open_trade = Trade{ date, "", execution_price, 0.0, shares, fees };//aggregate init
 	}
 	void sell(double price, const std::string& date) {
-		if (this->state == PositionState::IN_CASH || price <= 0)
+		if (!in_position() || price <= 0)
 			return;
-		if (!open_trade) return;
 		double execution_price = price * (1.0 - slippage);
 
 		double value = shares * execution_price;
@@ -103,7 +110,7 @@ public:
 
 		this->cash = value - fees;
 		this->shares = 0.0;
-		this->state = PositionState::IN_CASH;
+		
 
 		open_trade->exit_date = date;
 		open_trade->exit_price = execution_price;
@@ -113,7 +120,7 @@ public:
 		open_trade.reset();
 	}
 	double value(double price) const {
-		if (this->state == PositionState::IN_CASH)
+		if (!in_position())
 			return this->cash;
 		else
 			return this->shares * price;
@@ -391,7 +398,7 @@ public:
 		double avg_pnl = total_pnl / total_trades;
 		double avg_win = wins > 0 ? total_win / wins : 0.0;
 		double avg_loss = losses > 0 ? total_loss / losses : 0.0;
-		double profit_factor = total_win > 0 ? total_win / total_loss : 0.0;
+		double profit_factor = (total_loss > 0) ? total_win / total_loss : (total_win > 0.0 ? std::numeric_limits<double>::infinity() : 0.0);
 
 		double expectancy = win_rate * avg_win - (1 - win_rate) * avg_loss;//not sure of this
 
@@ -437,7 +444,7 @@ int main() {
 	b.run_backtest(p2,strat, Regimes::EASY);
 	Metrics m2(b.get_equity_curve());
 	m2.print_metrics(b.get_equity_curve());
-	
+	TradeMetrics::print(p2.get_trades());
 
 	Portfolio p3(10000);
 	b.clear();
