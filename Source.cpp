@@ -403,6 +403,7 @@ public:
 		double expectancy = win_rate * avg_win - (1 - win_rate) * avg_loss;//not sure of this
 
 		std::cout << "TRADES: " << total_trades << "\n";
+		std::cout << "EV: " << expectancy << "\n";
 		std::cout << "WIN RATE: " << win_rate * 100 << "%\n";
 		std::cout << "AVG TRADE PNL: " << avg_pnl << "\n";
 		std::cout << "AVG WIN: " << avg_win << "\n";
