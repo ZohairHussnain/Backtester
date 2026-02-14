@@ -170,7 +170,7 @@ private:
 	
 	json load_json(std::string ticker) {
 		namespace fs = std::filesystem;
-		std::string filename = ticker + ".json";
+		std::string filename = "ticker_data/" + ticker + ".json";
 		if (fs::exists(filename)) {
 			std::ifstream file(filename);
 			if (!file.is_open()) {
@@ -334,7 +334,7 @@ private:
 		sharpe = (mean / std) * std::sqrt(252.0);
 	}
 	void saveVector(const std::vector<double>& v) {
-		std::ofstream file("equity.dat");
+		std::ofstream file("output/equity.dat");
 		for (size_t i = 0; i < v.size(); ++i)
 			file << i << " " << v[i] << "\n";
 		file.close();
@@ -344,7 +344,7 @@ private:
 			"set xlabel 'Trade Number';"
 			"set ylabel 'Account Value';"
 			"set grid;"
-			"plot 'equity.dat' using 1:2 with lines lw 2 title 'Equity'\""
+			"plot 'output/equity.dat' using 1:2 with lines lw 2 title 'Equity'\""
 		);
 	}
 public:
