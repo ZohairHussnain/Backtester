@@ -1,0 +1,35 @@
+class Stats {
+public:
+    // Central tendency
+    static double mean(const std::vector<double>&);
+    static double ema(const std::vector<double>&, double alpha);
+
+    // Dispersion
+    static double variance(const std::vector<double>&);
+    static double stddev(const std::vector<double>&);
+
+    // Normalized deviation
+    static double zScore(double x, double mean, double stddev);
+    static double robustZ(double x, double median, double mad);
+
+    // Rolling
+    static double rollingMean(const std::vector<double>&, size_t index, size_t lookback);
+    static double rollingStd(const std::vector<double>&, size_t index, size_t lookback);
+
+    // Distribution-free
+    static double median(std::vector<double>);
+    static double mad(const std::vector<double>&);
+
+    // Returns
+    static std::vector<double> logReturns(const std::vector<double>&);
+    static std::vector<double> simpleReturns(const std::vector<double>&);
+
+    // Dependence
+    static double autocorr(const std::vector<double>&, size_t lag);
+    static double corr(const std::vector<double>&, const std::vector<double>&);
+
+    // Volatility
+    static double atr(const std::vector<double>& high,
+                      const std::vector<double>& low,
+                      const std::vector<double>& close);
+};

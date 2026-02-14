@@ -78,6 +78,9 @@ public:
 			return;
 		double execution_price = price * (1.0 + slippage);
 
+		double risk_per_trade = 0.01; // 1%
+
+
 		double sh = cash / execution_price; //first guess of shares
 		double fees = calculate_transaction_costs(execution_price, sh);
 
@@ -154,6 +157,11 @@ public:
 		return Signal::HOLD;
 	}
 };
+class MeanReversionStrategy : public Strategy {
+
+};
+
+
 
 class Backtest {
 private:
@@ -432,20 +440,20 @@ int main() {
 	*/
 
 
-	Portfolio p1(10000);
+	//Portfolio p1(10000);
 	MomentumStrategy strat(20);
 	Backtest b("AAPL", opt);
-	b.run_backtest(p1,strat, Regimes::STRESS);
-	Metrics m1(b.get_equity_curve());
-	m1.print_metrics(b.get_equity_curve());
-	
-	
-	Portfolio p2(10000);
-	b.clear();
-	b.run_backtest(p2,strat, Regimes::EASY);
-	Metrics m2(b.get_equity_curve());
-	m2.print_metrics(b.get_equity_curve());
-	TradeMetrics::print(p2.get_trades());
+	//b.run_backtest(p1,strat, Regimes::STRESS);
+	//Metrics m1(b.get_equity_curve());
+	//m1.print_metrics(b.get_equity_curve());
+	//
+	//
+	//Portfolio p2(10000);
+	//b.clear();
+	//b.run_backtest(p2,strat, Regimes::EASY);
+	//Metrics m2(b.get_equity_curve());
+	//m2.print_metrics(b.get_equity_curve());
+	//TradeMetrics::print(p2.get_trades());
 
 	Portfolio p3(10000);
 	b.clear();
