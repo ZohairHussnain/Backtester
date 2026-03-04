@@ -78,30 +78,21 @@ public:
 			return;
 		double execution_price = price * (1.0 + slippage);
 
-		double risk_per_trade = 0.01; // 1%
-
-
-		double sh = cash / execution_price; //first guess of shares
+		double sh = cash / execution_price;
+		for (int i = 0; i < 10; ++i) {
+			double fees = calculate_transaction_costs(execution_price, sh);
+			double refined = (cash - fees) / execution_price;
+			if (refined <= 0) return;
+			if (std::abs(refined - sh) < 1e-9) break;
+			sh = refined;
+		}
 		double fees = calculate_transaction_costs(execution_price, sh);
+		if (sh <= 0 || fees > cash) return;
 
-		double investable_cash = cash - fees;
-
-		if (investable_cash <= 0)
-			return;
-
-		sh = investable_cash / execution_price;
-		fees = calculate_transaction_costs(execution_price, sh);
-		investable_cash = cash - fees;
-
-		if (investable_cash <= 0)
-			return;
-
-		sh = investable_cash / execution_price;
 		this->shares = sh;
 		this->cash = 0.0;
-		
 
-		open_trade = Trade{ date, "", execution_price, 0.0, shares, fees };//aggregate init
+		open_trade = Trade{ date, "", execution_price, 0.0, sh, fees };
 	}
 	void sell(double price, const std::string& date) {
 		if (!in_position() || price <= 0)
@@ -217,9 +208,7 @@ private:
 				return a.date < b.date;
 			});
 		if (!verify_true(time_series))
-		{
-			exit(1);
-		}
+			throw std::runtime_error("Time series is not sorted in ascending order");
 	}
 	bool in_regime(const std::string& date, Regimes regime) {
 		if (regime == Regimes::STRESS) {
@@ -331,7 +320,8 @@ private:
 			return;
 		}
 
-		sharpe = (mean / std) * std::sqrt(252.0);
+		constexpr double daily_risk_free = 0.04 / 252.0;
+		sharpe = ((mean - daily_risk_free) / std) * std::sqrt(252.0);
 	}
 	void saveVector(const std::vector<double>& v) {
 		std::ofstream file("output/equity.dat");
@@ -419,6 +409,20 @@ public:
 		std::cout << "PROFIT FACTOR: " << profit_factor << "\n";
 		std::cout << "TOTAL FEES: " << total_fees << "\n";
 	}
+	static void save_csv(const std::vector<Trade>& trades, const std::string& path) {
+		std::ofstream f(path);
+		f << "entry_date,exit_date,entry_price,exit_price,shares,fees,pnl,return_pct\n";
+		for (const auto& t : trades) {
+			f << t.entry_date << ","
+			  << t.exit_date << ","
+			  << t.entry_price << ","
+			  << t.exit_price << ","
+			  << t.shares << ","
+			  << t.fees << ","
+			  << t.pnl() << ","
+			  << t.return_pct() << "\n";
+		}
+	}
 };
 
 int main() {
@@ -432,7 +436,7 @@ int main() {
 	std::cin >> opt;
 	
 	std::cout << "Select Regime:\n";
-	std::cout << "1: 2000–2009 stress test\n2: 2010–2019 easy regime\n3: 2020–2025 modern\n";
+	std::cout << "1: 2000ï¿½2009 stress test\n2: 2010ï¿½2019 easy regime\n3: 2020ï¿½2025 modern\n";
 	std::cin >> reg;
 	if(reg==1) regime = Regimes::STRESS;
 	if(reg==2) regime = Regimes::EASY;
@@ -461,6 +465,7 @@ int main() {
 	Metrics m3(b.get_equity_curve());
 	m3.print_metrics(b.get_equity_curve());
 	TradeMetrics::print(p3.get_trades());
+	TradeMetrics::save_csv(p3.get_trades(), "output/trades.csv");
 	
 
 	return 0;
