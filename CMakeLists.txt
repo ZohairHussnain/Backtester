@@ -20,3 +20,23 @@ target_link_libraries(BackTester PRIVATE
     cpr::cpr
     nlohmann_json::nlohmann_json
 )
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+enable_testing()
+
+# Locate Google Test (installed via libgtest-dev)
+find_package(GTest REQUIRED)
+
+add_executable(BacktesterTests
+    tests/test_backtester.cpp
+)
+
+target_include_directories(BacktesterTests PRIVATE ${CMAKE_SOURCE_DIR})
+
+target_link_libraries(BacktesterTests PRIVATE
+    GTest::GTest
+    GTest::Main
+)
+
+include(GoogleTest)
+gtest_discover_tests(BacktesterTests)
