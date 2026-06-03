@@ -12,6 +12,8 @@
 #include <cmath>
 #include <numeric>
 #include <limits>
+#include <map>
+#include <unordered_map>
 
 #include "Day.h"
 #include "FeatureEngine.h"
@@ -58,14 +60,20 @@ public:
 	}
 };
 
+struct Position {
+	std::string ticker;
+	double shares;
+	Trade trade;
+};
+
 class Portfolio {
 private:
 	double cash;
-	double shares;
-	std::optional<Trade> open_trade;
+	std::unordered_map<std::string, Position> positions;
 	std::vector<Trade> closed_trades;
 	double risk_per_trade;
 	double max_position_fraction;
+	int max_open_positions;
 	double slippage = 0.0005;
 	double calculate_transaction_costs(double price, double shares) const {
 		double trade_value = price * shares;
@@ -75,32 +83,48 @@ private:
 		commission = std::min(commission, 0.01 * trade_value); //max cost 1%
 		return commission;
 	}
+	double estimated_portfolio_value() const {
+		double total = cash;
+		for (const auto& [ticker, position] : positions) {
+			total += position.shares * position.trade.entry_price;
+		}
+		return total;
+	}
 public:
-	Portfolio() : cash(10000), shares(0), risk_per_trade(0.01), max_position_fraction(0.40) {}
-	Portfolio(double cash) : cash(cash), shares(0), risk_per_trade(0.01), max_position_fraction(0.40) {}
+	Portfolio() : cash(10000), risk_per_trade(0.01), max_position_fraction(0.40), max_open_positions(5) {}
+	Portfolio(double cash) : cash(cash), risk_per_trade(0.01), max_position_fraction(0.40), max_open_positions(5) {}
 	Portfolio(double cash, double risk_per_trade, double max_position_fraction)
-		: cash(cash), shares(0), risk_per_trade(risk_per_trade), max_position_fraction(max_position_fraction) {
+		: cash(cash), risk_per_trade(risk_per_trade), max_position_fraction(max_position_fraction), max_open_positions(5) {
 	}
-	bool in_position() const {
-		return open_trade.has_value();
+	Portfolio(double cash, double risk_per_trade, double max_position_fraction, int max_open_positions)
+		: cash(cash), risk_per_trade(risk_per_trade), max_position_fraction(max_position_fraction), max_open_positions(max_open_positions) {
 	}
-	double current_stop_price() const {
-		return open_trade ? open_trade->stop_price : 0.0;
+	bool in_position(const std::string& ticker) const {
+		return positions.find(ticker) != positions.end();
 	}
-	double current_target_price() const {
-		return open_trade ? open_trade->target_price : std::numeric_limits<double>::infinity();
+	int open_position_count() const {
+		return static_cast<int>(positions.size());
 	}
-	int current_entry_index() const {
-		return open_trade ? open_trade->entry_index : -1;
+	double current_stop_price(const std::string& ticker) const {
+		auto it = positions.find(ticker);
+		return it != positions.end() ? it->second.trade.stop_price : 0.0;
 	}
-	void buy(double price, const std::string& date, int index, double stop_price, double target_price) {
-		if (in_position() || price <= 0 || risk_per_trade <= 0 || max_position_fraction <= 0)
+	double current_target_price(const std::string& ticker) const {
+		auto it = positions.find(ticker);
+		return it != positions.end() ? it->second.trade.target_price : std::numeric_limits<double>::infinity();
+	}
+	int current_entry_index(const std::string& ticker) const {
+		auto it = positions.find(ticker);
+		return it != positions.end() ? it->second.trade.entry_index : -1;
+	}
+	void buy(const std::string& ticker, double price, const std::string& date, int index, double stop_price, double target_price) {
+		if (in_position(ticker) || open_position_count() >= max_open_positions || price <= 0 || risk_per_trade <= 0 || max_position_fraction <= 0)
 			return;
 		double execution_price = price * (1.0 + slippage);
 		if (stop_price >= execution_price)
 			return;
 
-		double portfolio_value = value(price);
+		double portfolio_value = estimated_portfolio_value();
 		double account_risk_dollars = portfolio_value * risk_per_trade;
 		double stop_distance = execution_price - stop_price;
 		double shares_by_risk = account_risk_dollars / stop_distance;
@@ -122,37 +146,41 @@ public:
 		double fees = calculate_transaction_costs(execution_price, sh);
 		if (sh <= 0 || sh * execution_price + fees > cash * max_position_fraction) return;
 
-		this->shares = sh;
 		this->cash -= sh * execution_price + fees;
 
-		open_trade = Trade{ date, "", execution_price, 0.0, sh, fees, stop_price, target_price, index, -1, "" };
+		Trade trade{ date, "", execution_price, 0.0, sh, fees, stop_price, target_price, index, -1, "" };
+		positions.emplace(ticker, Position{ ticker, sh, trade });
 	}
-	void sell(double price, const std::string& date, int index, const std::string& exit_reason) {
-		if (!in_position() || price <= 0)
+	void sell(const std::string& ticker, double price, const std::string& date, int index, const std::string& exit_reason) {
+		auto it = positions.find(ticker);
+		if (it == positions.end() || price <= 0)
 			return;
 		double execution_price = price * (1.0 - slippage);
 
-		double value = shares * execution_price;
-		double fees = calculate_transaction_costs(execution_price, shares);
+		Position& position = it->second;
+		double value = position.shares * execution_price;
+		double fees = calculate_transaction_costs(execution_price, position.shares);
 
 		this->cash += value - fees;
-		this->shares = 0.0;
 		
 
-		open_trade->exit_date = date;
-		open_trade->exit_price = execution_price;
-		open_trade->fees += fees;
-		open_trade->exit_index = index;
-		open_trade->exit_reason = exit_reason;
+		position.trade.exit_date = date;
+		position.trade.exit_price = execution_price;
+		position.trade.fees += fees;
+		position.trade.exit_index = index;
+		position.trade.exit_reason = exit_reason;
 		
-		closed_trades.push_back(*open_trade);
-		open_trade.reset();
+		closed_trades.push_back(position.trade);
+		positions.erase(it);
 	}
-	double value(double price) const {
-		if (!in_position())
-			return this->cash;
-		else
-			return this->cash + this->shares * price;
+	double value(const std::map<std::string, double>& latest_prices) const {
+		double total = this->cash;
+		for (const auto& [ticker, position] : positions) {
+			auto price_it = latest_prices.find(ticker);
+			double mark_price = price_it != latest_prices.end() ? price_it->second : position.trade.entry_price;
+			total += position.shares * mark_price;
+		}
+		return total;
 	}
 	const std::vector<Trade>& get_trades() const {
 		return closed_trades;
@@ -283,6 +311,7 @@ class MeanReversionStrategy : public Strategy {
 
 class Backtest {
 private:
+	std::string ticker;
 	std::vector<Day> time_series;
 	std::vector<double> equity_curve;
 	
@@ -363,7 +392,7 @@ private:
 		return date >= "2020-01-01" && date <= "2026-05-31";
 	}
 public:
-	Backtest(std::string ticker, int opt) { init_time_series(ticker); }
+	Backtest(std::string ticker, int opt) : ticker(ticker) { init_time_series(ticker); }
 	void run_backtest(Portfolio& p, Strategy& s, Regimes regime, int max_hold_days, double stop_loss_pct = 0.0, double target_profit_pct = 0.0) {
 		s.reset();
 		Signal signal{};
@@ -372,42 +401,42 @@ public:
 			if (!in_regime(time_series[i].date, regime))     continue;
 			if (!in_regime(time_series[i - 1].date, regime)) continue;
 			if (!in_regime(time_series[i - 2].date, regime)) continue;
-			signal = s.generate(time_series, i - 1, p.in_position());
+			signal = s.generate(time_series, i - 1, p.in_position(ticker));
 			price = time_series[i].close;
 			bool exited_today = false;
 
-			if (p.in_position()) {
+			if (p.in_position(ticker)) {
 				const Day& day = time_series[i];
 				int index = static_cast<int>(i);
-				double stop_price = p.current_stop_price();
-				double target_price = p.current_target_price();
+				double stop_price = p.current_stop_price(ticker);
+				double target_price = p.current_target_price(ticker);
 
 				if (stop_price > 0.0 && day.low <= stop_price) {
-					p.sell(stop_price, day.date, index, "stop_loss");
+					p.sell(ticker, stop_price, day.date, index, "stop_loss");
 					exited_today = true;
 				}
 				else if (std::isfinite(target_price) && day.high >= target_price) {
-					p.sell(target_price, day.date, index, "take_profit");
+					p.sell(ticker, target_price, day.date, index, "take_profit");
 					exited_today = true;
 				}
-				else if (max_hold_days > 0 && p.current_entry_index() >= 0 && index - p.current_entry_index() >= max_hold_days) {
-					p.sell(price, day.date, index, "max_hold");
+				else if (max_hold_days > 0 && p.current_entry_index(ticker) >= 0 && index - p.current_entry_index(ticker) >= max_hold_days) {
+					p.sell(ticker, price, day.date, index, "max_hold");
 					exited_today = true;
 				}
 				else if (signal == Signal::SELL) {
-					p.sell(price, day.date, index, "strategy_sell");
+					p.sell(ticker, price, day.date, index, "strategy_sell");
 					exited_today = true;
 					//std::cout << "SELL @" << price << std::endl;
 				}
 			}
 
-			if (signal == Signal::BUY && !p.in_position() && !exited_today) {
+			if (signal == Signal::BUY && !p.in_position(ticker) && !exited_today) {
 				double stop_price = stop_loss_pct > 0.0 ? price * (1.0 - stop_loss_pct) : 0.0;
 				double target_price = target_profit_pct > 0.0 ? price * (1.0 + target_profit_pct) : std::numeric_limits<double>::infinity();
-				p.buy(price, time_series[i].date, static_cast<int>(i), stop_price, target_price);
+				p.buy(ticker, price, time_series[i].date, static_cast<int>(i), stop_price, target_price);
 				//std::cout << "BUY @" << price << std::endl;
 			}
-			equity_curve.push_back(p.value(price));
+			equity_curve.push_back(p.value({ { ticker, price } }));
 		}
 	}
 	void print_equity_curve() {
@@ -609,10 +638,12 @@ int main() {
 	// Portfolio risk controls:
 	// - risk_per_trade = 0.01 risks about 1% of portfolio value if the stop is hit.
 	// - max_position_fraction = 0.40 caps a single position at 40% of available cash.
+	// - max_open_positions caps how many tickers can be held at once.
 	double starting_cash = 10000.0;
 	double risk_per_trade = 0.01;
 	double max_position_fraction = 0.40;
-	Portfolio portfolio(starting_cash, risk_per_trade, max_position_fraction);
+	int max_open_positions = 5;
+	Portfolio portfolio(starting_cash, risk_per_trade, max_position_fraction, max_open_positions);
 
 	// Strategy setup:
 	// MomentumStrategy(20) compares recent price action against a 20-day lookback.
@@ -639,6 +670,7 @@ int main() {
 	std::cout << "Starting cash: " << starting_cash << "\n";
 	std::cout << "Risk per trade: " << risk_per_trade * 100.0 << "%\n";
 	std::cout << "Max position fraction: " << max_position_fraction * 100.0 << "%\n";
+	std::cout << "Max open positions: " << max_open_positions << "\n";
 	std::cout << "Stop loss: " << stop_loss_pct * 100.0 << "%, target: " << target_profit_pct * 100.0 << "%, max hold: " << max_hold_days << " days\n";
 
 	b.clear();
