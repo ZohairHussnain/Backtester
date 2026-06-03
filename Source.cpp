@@ -22,8 +22,10 @@ struct Day {
 	double high;
 	double low;
 	double close;
-	Day(std::string date, double open, double high, double low, double close)
-		: date(date), open(open), high(high), low(low), close(close) {
+	double adjusted_close;
+	double volume;
+	Day(std::string date, double open, double high, double low, double close, double adjusted_close, double volume)
+		: date(date), open(open), high(high), low(low), close(close), adjusted_close(adjusted_close), volume(volume) {
 	}
 };
 enum class PositionState {
@@ -254,8 +256,21 @@ private:
 			double high = row.at("High").get<double>();
 			double low = row.at("Low").get<double>();
 			double close = row.at("Close").get<double>();
+			double adjusted_close = close;
 
-			time_series.emplace_back(date, open, high, low, close);
+			if (row.contains("Adjusted Close")) {
+				adjusted_close = row.at("Adjusted Close").get<double>();
+			}
+			else if (row.contains("Adj Close")) {
+				adjusted_close = row.at("Adj Close").get<double>();
+			}
+
+			if (!row.contains("Volume")) {
+				throw std::runtime_error("Missing required Volume field for date: " + date);
+			}
+			double volume = row.at("Volume").get<double>();
+
+			time_series.emplace_back(date, open, high, low, close, adjusted_close, volume);
 		}
 		std::sort(time_series.begin(), time_series.end(),
 			[](const Day& a, const Day& b) {
@@ -500,8 +515,8 @@ int main() {
 
 
 	//Portfolio p1(10000);
-	//MomentumStrategy strat(20);
-	FixedPriceStrategy strat(2.30, 2.75);
+	MomentumStrategy strat(20);
+	//FixedPriceStrategy strat(2.30, 2.75);
 	Backtest b("AAPL", opt);
 	//b.run_backtest(p1,strat, Regimes::STRESS);
 	//Metrics m1(b.get_equity_curve());
