@@ -16,6 +16,7 @@
 #include "Day.h"
 #include "FeatureEngine.h"
 #include "LabelEngine.h"
+#include "MLDataExporter.h"
 
 using json = nlohmann::json;
 using response = cpr::Response;
@@ -370,6 +371,9 @@ public:
 	const std::vector<double>& get_equity_curve() const {
 		return this->equity_curve;
 	}
+	const std::vector<Day>& get_time_series() const {
+		return this->time_series;
+	}
 	void clear() {
 		equity_curve.clear();
 	}
@@ -569,7 +573,8 @@ int main() {
 
 	// Backtest setup:
 	// ticker data is loaded from ticker_data/AAPL.json.
-	Backtest b("AAPL", opt);
+	std::string ticker = "AAPL";
+	Backtest b(ticker, opt);
 
 	// Swing trade management:
 	// - max_hold_days exits after this many bars in a trade.
@@ -596,6 +601,14 @@ int main() {
 
 	// CSV includes stop_price, target_price, entry/exit index, and exit_reason.
 	TradeMetrics::save_csv(portfolio.get_trades(), "output/trades.csv");
+
+	// ML dataset export:
+	// Features use only past/current data; labels use future OHLC for the same dates.
+	// The exporter joins rows by date + ticker and writes only rows with both sides.
+	auto features = FeatureEngine::generate(ticker, b.get_time_series());
+	auto labels = LabelEngine::generate(ticker, b.get_time_series(), target_profit_pct, stop_loss_pct, max_hold_days);
+	size_t ml_rows = MLDataExporter::save_csv(features, labels);
+	std::cout << "ML rows exported: " << ml_rows << " to output/ml_dataset.csv\n";
 	
 
 	return 0;
