@@ -162,6 +162,11 @@ public:
 class Strategy {
 public:
 	virtual Signal generate(const std::vector<Day>& time_series, size_t i) = 0;
+	// Position-aware strategies can override this overload. Existing strategies keep
+	// the original interface and are adapted here, which keeps this change minimal.
+	virtual Signal generate(const std::vector<Day>& time_series, size_t i, bool in_position) {
+		return generate(time_series, i);
+	}
 	virtual void reset() {}
 	virtual ~Strategy() = default;
 };
@@ -198,6 +203,47 @@ public:
 		if (!has_bought) {
 			has_bought = true;
 			return Signal::BUY;
+		}
+
+		return Signal::HOLD;
+	}
+};
+class MLProbabilityStrategy : public Strategy {
+private:
+	std::string ticker;
+	const PredictionLoader& predictions;
+	double buy_threshold;
+	std::optional<double> sell_threshold;
+
+public:
+	MLProbabilityStrategy(
+		const std::string& ticker,
+		const PredictionLoader& predictions,
+		double buy_threshold,
+		std::optional<double> sell_threshold = std::nullopt
+	)
+		: ticker(ticker), predictions(predictions), buy_threshold(buy_threshold), sell_threshold(sell_threshold) {
+	}
+
+	Signal generate(const std::vector<Day>& time_series, size_t i) override {
+		return generate(time_series, i, false);
+	}
+
+	Signal generate(const std::vector<Day>& time_series, size_t i, bool in_position) override {
+		if (time_series.empty() || i >= time_series.size()) {
+			return Signal::HOLD;
+		}
+
+		auto probability = predictions.get_probability(time_series[i].date, ticker);
+		if (!probability.has_value()) {
+			return Signal::HOLD;
+		}
+
+		if (!in_position && *probability >= buy_threshold) {
+			return Signal::BUY;
+		}
+		if (in_position && sell_threshold.has_value() && *probability <= *sell_threshold) {
+			return Signal::SELL;
 		}
 
 		return Signal::HOLD;
@@ -326,7 +372,7 @@ public:
 			if (!in_regime(time_series[i].date, regime))     continue;
 			if (!in_regime(time_series[i - 1].date, regime)) continue;
 			if (!in_regime(time_series[i - 2].date, regime)) continue;
-			signal = s.generate(time_series, i - 1);
+			signal = s.generate(time_series, i - 1, p.in_position());
 			price = time_series[i].close;
 			bool exited_today = false;
 
@@ -557,6 +603,7 @@ public:
 
 int main() {
 	int opt = 1;
+	std::string ticker = "AAPL";
 	Regimes regime{Regimes::MODERN};
 
 	// Portfolio risk controls:
@@ -571,10 +618,12 @@ int main() {
 	// MomentumStrategy(20) compares recent price action against a 20-day lookback.
 	MomentumStrategy strat(20);
 	//FixedPriceStrategy strat(2.30, 2.75);
+	// ML strategy usage:
+	// PredictionLoader predictions("output/predictions.csv");
+	// MLProbabilityStrategy strat(ticker, predictions, 0.60, 0.40);
 
 	// Backtest setup:
 	// ticker data is loaded from ticker_data/AAPL.json.
-	std::string ticker = "AAPL";
 	Backtest b(ticker, opt);
 
 	// Swing trade management:
