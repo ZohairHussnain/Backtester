@@ -50,6 +50,11 @@ public:
 	double exit_price;
 	double shares;
 	double fees;
+	double stop_price;
+	double target_price;
+	int entry_index;
+	int exit_index;
+	std::string exit_reason;
 
 	double pnl() const {
 		return (exit_price - entry_price) * shares - fees;
@@ -80,7 +85,16 @@ public:
 	bool in_position() const {
 		return open_trade.has_value();
 	}
-	void buy(double price, const std::string& date) {
+	double current_stop_price() const {
+		return open_trade ? open_trade->stop_price : 0.0;
+	}
+	double current_target_price() const {
+		return open_trade ? open_trade->target_price : std::numeric_limits<double>::infinity();
+	}
+	int current_entry_index() const {
+		return open_trade ? open_trade->entry_index : -1;
+	}
+	void buy(double price, const std::string& date, int index, double stop_price, double target_price) {
 		if (in_position() || price <= 0)
 			return;
 		double execution_price = price * (1.0 + slippage);
@@ -99,9 +113,9 @@ public:
 		this->shares = sh;
 		this->cash = 0.0;
 
-		open_trade = Trade{ date, "", execution_price, 0.0, sh, fees };
+		open_trade = Trade{ date, "", execution_price, 0.0, sh, fees, stop_price, target_price, index, -1, "" };
 	}
-	void sell(double price, const std::string& date) {
+	void sell(double price, const std::string& date, int index, const std::string& exit_reason) {
 		if (!in_position() || price <= 0)
 			return;
 		double execution_price = price * (1.0 - slippage);
@@ -116,6 +130,8 @@ public:
 		open_trade->exit_date = date;
 		open_trade->exit_price = execution_price;
 		open_trade->fees += fees;
+		open_trade->exit_index = index;
+		open_trade->exit_reason = exit_reason;
 		
 		closed_trades.push_back(*open_trade);
 		open_trade.reset();
@@ -290,7 +306,7 @@ private:
 	}
 public:
 	Backtest(std::string ticker, int opt) { init_time_series(ticker); }
-	void run_backtest(Portfolio& p, Strategy& s, Regimes regime) {
+	void run_backtest(Portfolio& p, Strategy& s, Regimes regime, int max_hold_days, double stop_loss_pct = 0.0, double target_profit_pct = 0.0) {
 		s.reset();
 		Signal signal{};
 		double price{};
@@ -300,14 +316,38 @@ public:
 			if (!in_regime(time_series[i - 2].date, regime)) continue;
 			signal = s.generate(time_series, i - 1);
 			price = time_series[i].close;
+			bool exited_today = false;
 
-			if (signal == Signal::BUY && !p.in_position()) {
-				p.buy(price, time_series[i].date);
-				//std::cout << "BUY @" << price << std::endl;
+			if (p.in_position()) {
+				const Day& day = time_series[i];
+				int index = static_cast<int>(i);
+				double stop_price = p.current_stop_price();
+				double target_price = p.current_target_price();
+
+				if (stop_price > 0.0 && day.low <= stop_price) {
+					p.sell(stop_price, day.date, index, "stop_loss");
+					exited_today = true;
+				}
+				else if (std::isfinite(target_price) && day.high >= target_price) {
+					p.sell(target_price, day.date, index, "take_profit");
+					exited_today = true;
+				}
+				else if (max_hold_days > 0 && p.current_entry_index() >= 0 && index - p.current_entry_index() >= max_hold_days) {
+					p.sell(price, day.date, index, "max_hold");
+					exited_today = true;
+				}
+				else if (signal == Signal::SELL) {
+					p.sell(price, day.date, index, "strategy_sell");
+					exited_today = true;
+					//std::cout << "SELL @" << price << std::endl;
+				}
 			}
-			if (signal == Signal::SELL && p.in_position()) {
-				p.sell(price, time_series[i].date);
-				//std::cout << "SELL @" << price << std::endl;
+
+			if (signal == Signal::BUY && !p.in_position() && !exited_today) {
+				double stop_price = stop_loss_pct > 0.0 ? price * (1.0 - stop_loss_pct) : 0.0;
+				double target_price = target_profit_pct > 0.0 ? price * (1.0 + target_profit_pct) : std::numeric_limits<double>::infinity();
+				p.buy(price, time_series[i].date, static_cast<int>(i), stop_price, target_price);
+				//std::cout << "BUY @" << price << std::endl;
 			}
 			equity_curve.push_back(p.value(price));
 		}
@@ -481,7 +521,7 @@ public:
 	}
 	static void save_csv(const std::vector<Trade>& trades, const std::string& path) {
 		std::ofstream f(path);
-		f << "entry_date,exit_date,entry_price,exit_price,shares,fees,pnl,return_pct\n";
+		f << "entry_date,exit_date,entry_price,exit_price,shares,fees,stop_price,target_price,entry_index,exit_index,exit_reason,pnl,return_pct\n";
 		for (const auto& t : trades) {
 			f << t.entry_date << ","
 			  << t.exit_date << ","
@@ -489,6 +529,11 @@ public:
 			  << t.exit_price << ","
 			  << t.shares << ","
 			  << t.fees << ","
+			  << t.stop_price << ","
+			  << t.target_price << ","
+			  << t.entry_index << ","
+			  << t.exit_index << ","
+			  << t.exit_reason << ","
 			  << t.pnl() << ","
 			  << t.return_pct() << "\n";
 		}
@@ -518,21 +563,21 @@ int main() {
 	MomentumStrategy strat(20);
 	//FixedPriceStrategy strat(2.30, 2.75);
 	Backtest b("AAPL", opt);
-	//b.run_backtest(p1,strat, Regimes::STRESS);
+	//b.run_backtest(p1,strat, Regimes::STRESS, 20);
 	//Metrics m1(b.get_equity_curve());
 	//m1.print_metrics(b.get_equity_curve());
 	//
 	//
 	//Portfolio p2(10000);
 	//b.clear();
-	//b.run_backtest(p2,strat, Regimes::EASY);
+	//b.run_backtest(p2,strat, Regimes::EASY, 20);
 	//Metrics m2(b.get_equity_curve());
 	//m2.print_metrics(b.get_equity_curve());
 	//TradeMetrics::print(p2.get_trades());
 
 	Portfolio p3(10000);
 	b.clear();
-	b.run_backtest(p3,strat, Regimes::MODERN);
+	b.run_backtest(p3,strat, Regimes::MODERN, 20);
 	Metrics m3(b.get_equity_curve());
 	m3.print_metrics(b.get_equity_curve());
 	TradeMetrics::print(p3.get_trades());
