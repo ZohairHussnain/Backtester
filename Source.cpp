@@ -70,6 +70,8 @@ private:
 	double shares;
 	std::optional<Trade> open_trade;
 	std::vector<Trade> closed_trades;
+	double risk_per_trade;
+	double max_position_fraction;
 	double slippage = 0.0005;
 	double calculate_transaction_costs(double price, double shares) const {
 		double trade_value = price * shares;
@@ -80,8 +82,11 @@ private:
 		return commission;
 	}
 public:
-	Portfolio() : cash(10000), shares(0) {}
-	Portfolio(double cash) : cash(cash), shares(0) {}
+	Portfolio() : cash(10000), shares(0), risk_per_trade(0.01), max_position_fraction(0.40) {}
+	Portfolio(double cash) : cash(cash), shares(0), risk_per_trade(0.01), max_position_fraction(0.40) {}
+	Portfolio(double cash, double risk_per_trade, double max_position_fraction)
+		: cash(cash), shares(0), risk_per_trade(risk_per_trade), max_position_fraction(max_position_fraction) {
+	}
 	bool in_position() const {
 		return open_trade.has_value();
 	}
@@ -95,23 +100,36 @@ public:
 		return open_trade ? open_trade->entry_index : -1;
 	}
 	void buy(double price, const std::string& date, int index, double stop_price, double target_price) {
-		if (in_position() || price <= 0)
+		if (in_position() || price <= 0 || risk_per_trade <= 0 || max_position_fraction <= 0)
 			return;
 		double execution_price = price * (1.0 + slippage);
+		if (stop_price >= execution_price)
+			return;
 
-		double sh = cash / execution_price;
+		double portfolio_value = value(price);
+		double account_risk_dollars = portfolio_value * risk_per_trade;
+		double stop_distance = execution_price - stop_price;
+		double shares_by_risk = account_risk_dollars / stop_distance;
+		double shares_by_cash = (cash * max_position_fraction) / execution_price;
+		double sh = std::min(shares_by_risk, shares_by_cash);
 		for (int i = 0; i < 10; ++i) {
 			double fees = calculate_transaction_costs(execution_price, sh);
-			double refined = (cash - fees) / execution_price;
+			double stop_execution_price = stop_price * (1.0 - slippage);
+			double exit_fees = calculate_transaction_costs(stop_execution_price, sh);
+			double risk_with_costs = (execution_price - stop_execution_price) * sh + fees + exit_fees;
+			double cash_budget = cash * max_position_fraction;
+			double refined_by_risk = risk_with_costs > 0.0 ? sh * (account_risk_dollars / risk_with_costs) : 0.0;
+			double refined_by_cash = (cash_budget - fees) / execution_price;
+			double refined = std::min({ sh, refined_by_risk, refined_by_cash });
 			if (refined <= 0) return;
 			if (std::abs(refined - sh) < 1e-9) break;
 			sh = refined;
 		}
 		double fees = calculate_transaction_costs(execution_price, sh);
-		if (sh <= 0 || fees > cash) return;
+		if (sh <= 0 || sh * execution_price + fees > cash * max_position_fraction) return;
 
 		this->shares = sh;
-		this->cash = 0.0;
+		this->cash -= sh * execution_price + fees;
 
 		open_trade = Trade{ date, "", execution_price, 0.0, sh, fees, stop_price, target_price, index, -1, "" };
 	}
@@ -123,7 +141,7 @@ public:
 		double value = shares * execution_price;
 		double fees = calculate_transaction_costs(execution_price, shares);
 
-		this->cash = value - fees;
+		this->cash += value - fees;
 		this->shares = 0.0;
 		
 
@@ -140,7 +158,7 @@ public:
 		if (!in_position())
 			return this->cash;
 		else
-			return this->shares * price;
+			return this->cash + this->shares * price;
 	}
 	const std::vector<Trade>& get_trades() const {
 		return closed_trades;
@@ -542,46 +560,50 @@ public:
 
 int main() {
 	int opt = 1;
-	int reg = 3;
 	Regimes regime{Regimes::MODERN};
-	/*
-	std::cout << "Select ticker:\n";
-	std::cout << "1. AAPL\n";
-	std::cout << "Custom Search(Limited to 100 trading days):\n";
-	std::cin >> opt;
-	
-	std::cout << "Select Regime:\n";
-	std::cout << "1: 2000�2009 stress test\n2: 2010�2019 easy regime\n3: 2020�2025 modern\n";
-	std::cin >> reg;
-	if(reg==1) regime = Regimes::STRESS;
-	if(reg==2) regime = Regimes::EASY;
-	if(reg==3) regime = Regimes::MODERN;
-	*/
 
+	// Portfolio risk controls:
+	// - risk_per_trade = 0.01 risks about 1% of portfolio value if the stop is hit.
+	// - max_position_fraction = 0.40 caps a single position at 40% of available cash.
+	double starting_cash = 10000.0;
+	double risk_per_trade = 0.01;
+	double max_position_fraction = 0.40;
+	Portfolio portfolio(starting_cash, risk_per_trade, max_position_fraction);
 
-	//Portfolio p1(10000);
+	// Strategy setup:
+	// MomentumStrategy(20) compares recent price action against a 20-day lookback.
 	MomentumStrategy strat(20);
 	//FixedPriceStrategy strat(2.30, 2.75);
-	Backtest b("AAPL", opt);
-	//b.run_backtest(p1,strat, Regimes::STRESS, 20);
-	//Metrics m1(b.get_equity_curve());
-	//m1.print_metrics(b.get_equity_curve());
-	//
-	//
-	//Portfolio p2(10000);
-	//b.clear();
-	//b.run_backtest(p2,strat, Regimes::EASY, 20);
-	//Metrics m2(b.get_equity_curve());
-	//m2.print_metrics(b.get_equity_curve());
-	//TradeMetrics::print(p2.get_trades());
 
-	Portfolio p3(10000);
+	// Backtest setup:
+	// ticker data is loaded from ticker_data/AAPL.json.
+	Backtest b("AAPL", opt);
+
+	// Swing trade management:
+	// - max_hold_days exits after this many bars in a trade.
+	// - stop_loss_pct sets stop_price below entry.
+	// - target_profit_pct sets target_price above entry.
+	// If stop and target are both hit on the same day, the backtest assumes stop first.
+	int max_hold_days = 20;
+	double stop_loss_pct = 0.05;
+	double target_profit_pct = 0.10;
+
+	std::cout << "Running AAPL swing backtest\n";
+	std::cout << "Starting cash: " << starting_cash << "\n";
+	std::cout << "Risk per trade: " << risk_per_trade * 100.0 << "%\n";
+	std::cout << "Max position fraction: " << max_position_fraction * 100.0 << "%\n";
+	std::cout << "Stop loss: " << stop_loss_pct * 100.0 << "%, target: " << target_profit_pct * 100.0 << "%, max hold: " << max_hold_days << " days\n";
+
 	b.clear();
-	b.run_backtest(p3,strat, Regimes::MODERN, 20);
+	b.run_backtest(portfolio, strat, regime, max_hold_days, stop_loss_pct, target_profit_pct);
+
 	Metrics m3(b.get_equity_curve());
 	m3.print_metrics(b.get_equity_curve());
-	TradeMetrics::print(p3.get_trades());
-	TradeMetrics::save_csv(p3.get_trades(), "output/trades.csv");
+	TradeMetrics::print(portfolio.get_trades());
+	std::cout << "Closed trades: " << portfolio.get_trades().size() << "\n";
+
+	// CSV includes stop_price, target_price, entry/exit index, and exit_reason.
+	TradeMetrics::save_csv(portfolio.get_trades(), "output/trades.csv");
 	
 
 	return 0;
