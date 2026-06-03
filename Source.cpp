@@ -633,6 +633,7 @@ public:
 int main() {
 	int opt = 1;
 	std::string ticker = "AAPL";
+	std::string rr_ticker = "RR";
 	Regimes regime{Regimes::MODERN};
 
 	// Portfolio risk controls:
@@ -654,8 +655,9 @@ int main() {
 	// MLProbabilityStrategy strat(ticker, predictions, 0.60, 0.40);
 
 	// Backtest setup:
-	// ticker data is loaded from ticker_data/AAPL.json.
+	// ticker data is loaded from ticker_data/AAPL.json and ticker_data/RR.json.
 	Backtest b(ticker, opt);
+	Backtest rr_backtest(rr_ticker, opt);
 
 	// Swing trade management:
 	// - max_hold_days exits after this many bars in a trade.
@@ -678,6 +680,12 @@ int main() {
 
 	Metrics m3(b.get_equity_curve());
 	m3.print_metrics(b.get_equity_curve());
+
+	// RR is loaded to show the same portfolio API can support multiple tickers.
+	// Do not run a second independent Backtest here: one shared Portfolio should
+	// have one equity curve, recorded by a shared calendar loop across tickers.
+	std::cout << "RR rows loaded for multi-ticker support: " << rr_backtest.get_time_series().size() << "\n";
+
 	TradeMetrics::print(portfolio.get_trades());
 	std::cout << "Closed trades: " << portfolio.get_trades().size() << "\n";
 
