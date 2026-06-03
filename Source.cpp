@@ -15,6 +15,7 @@
 
 #include "Day.h"
 #include "FeatureEngine.h"
+#include "LabelEngine.h"
 
 using json = nlohmann::json;
 using response = cpr::Response;

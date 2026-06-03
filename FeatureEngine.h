@@ -109,15 +109,16 @@ private:
 	}
 
 public:
+	static constexpr size_t minimum_history = 200;
+
 	static std::vector<FeatureRow> generate(const std::string& ticker, const std::vector<Day>& days) {
 		std::vector<FeatureRow> features;
-		constexpr size_t min_history = 200;
-		if (days.size() < min_history) {
+		if (days.size() < minimum_history) {
 			return features;
 		}
 
-		features.reserve(days.size() - min_history + 1);
-		for (size_t i = min_history - 1; i < days.size(); ++i) {
+		features.reserve(days.size() - minimum_history + 1);
+		for (size_t i = minimum_history - 1; i < days.size(); ++i) {
 			double ma20 = average_adjusted_close(days, i, 20);
 			double ma50 = average_adjusted_close(days, i, 50);
 			double ma200 = average_adjusted_close(days, i, 200);
@@ -144,5 +145,4 @@ public:
 		return features;
 	}
 };
-
 
