@@ -13,21 +13,12 @@
 #include <numeric>
 #include <limits>
 
+#include "Day.h"
+#include "FeatureEngine.h"
+
 using json = nlohmann::json;
 using response = cpr::Response;
 
-struct Day {
-	std::string date;
-	double open;
-	double high;
-	double low;
-	double close;
-	double adjusted_close;
-	double volume;
-	Day(std::string date, double open, double high, double low, double close, double adjusted_close, double volume)
-		: date(date), open(open), high(high), low(low), close(close), adjusted_close(adjusted_close), volume(volume) {
-	}
-};
 enum class PositionState {
 	IN_CASH,
 	IN_POSITION
