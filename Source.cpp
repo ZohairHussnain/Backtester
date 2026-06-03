@@ -18,8 +18,13 @@ using response = cpr::Response;
 
 struct Day {
 	std::string date;
+	double open;
+	double high;
+	double low;
 	double close;
-	Day(std::string date, double close) : date(date), close(close) {}
+	Day(std::string date, double open, double high, double low, double close)
+		: date(date), open(open), high(high), low(low), close(close) {
+	}
 };
 enum class PositionState {
 	IN_CASH,
@@ -135,7 +140,8 @@ public:
 
 class Strategy {
 public:
-	virtual Signal generate(const std::vector<Day>& time_series, size_t i) const = 0;
+	virtual Signal generate(const std::vector<Day>& time_series, size_t i) = 0;
+	virtual void reset() {}
 	virtual ~Strategy() = default;
 };
 class MomentumStrategy : public Strategy {
@@ -145,7 +151,7 @@ public:
 	explicit MomentumStrategy(size_t lookback = 20)
 		: lookback(lookback) {
 	}
-	Signal generate(const std::vector<Day>& time_series, size_t i) const override {
+	Signal generate(const std::vector<Day>& time_series, size_t i) override {
 		if (i < lookback)
 			return Signal::HOLD;
 
@@ -154,6 +160,51 @@ public:
 
 		if (now > past) return Signal::BUY;
 		if (now < past) return Signal::SELL;
+		return Signal::HOLD;
+	}
+};
+class BuyAndHoldStrategy : public Strategy {
+private:
+	bool has_bought = false;
+public:
+	void reset() override {
+		has_bought = false;
+	}
+	Signal generate(const std::vector<Day>& time_series, size_t i) override {
+		if (time_series.empty() || i >= time_series.size())
+			return Signal::HOLD;
+
+		if (!has_bought) {
+			has_bought = true;
+			return Signal::BUY;
+		}
+
+		return Signal::HOLD;
+	}
+};
+class FixedPriceStrategy : public Strategy {
+private:
+	double buy_price;
+	double sell_price;
+public:
+	FixedPriceStrategy(double buy_price, double sell_price)
+		: buy_price(buy_price), sell_price(sell_price) {
+	}
+
+	Signal generate(const std::vector<Day>& time_series, size_t i) override {
+		if (time_series.empty() || i >= time_series.size())
+			return Signal::HOLD;
+
+		const Day& day = time_series[i];
+
+		if (day.low <= buy_price) {
+			return Signal::BUY;
+		}
+
+		if (day.high >= sell_price) {
+			return Signal::SELL;
+		}
+
 		return Signal::HOLD;
 	}
 };
@@ -208,9 +259,12 @@ private:
 			std::string full_date = row.at("Date").get<std::string>();
 			std::string date = full_date.substr(0, 10);
 
+			double open = row.at("Open").get<double>();
+			double high = row.at("High").get<double>();
+			double low = row.at("Low").get<double>();
 			double close = row.at("Close").get<double>();
 
-			time_series.emplace_back(date, close);
+			time_series.emplace_back(date, open, high, low, close);
 		}
 		std::sort(time_series.begin(), time_series.end(),
 			[](const Day& a, const Day& b) {
@@ -228,11 +282,12 @@ private:
 		if (regime == Regimes::EASY) {
 			return date >= "2010-01-01" && date <= "2019-12-31";
 		}
-		return date >= "2020-01-01" && date <= "2025-12-31";
+		return date >= "2020-01-01" && date <= "2026-05-31";
 	}
 public:
 	Backtest(std::string ticker, int opt) { init_time_series(ticker); }
-	void run_backtest(Portfolio& p, const Strategy& s, Regimes regime) {
+	void run_backtest(Portfolio& p, Strategy& s, Regimes regime) {
+		s.reset();
 		Signal signal{};
 		double price{};
 		for (size_t i = 2; i < time_series.size(); i++) {
@@ -341,7 +396,7 @@ private:
 		system(
 			"gnuplot -persist -e \""
 			"set title 'Equity Curve';"
-			"set xlabel 'Trade Number';"
+			"set xlabel 'Trading Days';"
 			"set ylabel 'Account Value';"
 			"set grid;"
 			"plot 'output/equity.dat' using 1:2 with lines lw 2 title 'Equity'\""
@@ -441,7 +496,8 @@ int main() {
 
 
 	//Portfolio p1(10000);
-	MomentumStrategy strat(20);
+	//MomentumStrategy strat(20);
+	FixedPriceStrategy strat(2.30, 2.75);
 	Backtest b("AAPL", opt);
 	//b.run_backtest(p1,strat, Regimes::STRESS);
 	//Metrics m1(b.get_equity_curve());
@@ -465,3 +521,4 @@ int main() {
 
 	return 0;
 }
+
