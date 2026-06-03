@@ -13,6 +13,7 @@
 #include <numeric>
 #include <limits>
 #include <map>
+#include <set>
 #include <unordered_map>
 
 #include "Day.h"
@@ -104,6 +105,9 @@ public:
 	}
 	int open_position_count() const {
 		return static_cast<int>(positions.size());
+	}
+	int max_open_position_count() const {
+		return max_open_positions;
 	}
 	double current_stop_price(const std::string& ticker) const {
 		auto it = positions.find(ticker);
@@ -455,6 +459,334 @@ public:
 	}
 };
 
+class MultiAssetBacktest {
+private:
+	struct EntryCandidate {
+		std::string ticker;
+		double probability;
+		double price;
+		std::string date;
+	};
+
+	std::vector<std::string> tickers;
+	std::map<std::string, std::vector<Day>> data;
+	Portfolio portfolio;
+	std::vector<double> equity_curve;
+
+	json load_json(const std::string& ticker) {
+		namespace fs = std::filesystem;
+		std::string filename = "ticker_data/" + ticker + ".json";
+		if (!fs::exists(filename)) {
+			throw std::runtime_error("JSON not found: " + filename);
+		}
+
+		std::ifstream file(filename);
+		if (!file.is_open()) {
+			throw std::runtime_error("File exists but cannot be opened: " + filename);
+		}
+
+		json j;
+		file >> j;
+		return j;
+	}
+
+	std::vector<Day> load_days(const std::string& ticker) {
+		json rows = load_json(ticker);
+		if (!rows.is_array()) {
+			throw std::runtime_error("Expected JSON array at root for ticker: " + ticker);
+		}
+
+		std::vector<Day> days;
+		days.reserve(rows.size());
+		for (const auto& row : rows) {
+			std::string full_date = row.at("Date").get<std::string>();
+			std::string date = full_date.substr(0, 10);
+			double open = row.at("Open").get<double>();
+			double high = row.at("High").get<double>();
+			double low = row.at("Low").get<double>();
+			double close = row.at("Close").get<double>();
+			double adjusted_close = close;
+
+			if (row.contains("Adjusted Close")) {
+				adjusted_close = row.at("Adjusted Close").get<double>();
+			}
+			else if (row.contains("Adj Close")) {
+				adjusted_close = row.at("Adj Close").get<double>();
+			}
+
+			if (!row.contains("Volume")) {
+				throw std::runtime_error("Missing required Volume field for " + ticker + " on date: " + date);
+			}
+			double volume = row.at("Volume").get<double>();
+
+			days.emplace_back(date, open, high, low, close, adjusted_close, volume);
+		}
+
+		std::sort(days.begin(), days.end(),
+			[](const Day& a, const Day& b) {
+				return a.date < b.date;
+			});
+		return days;
+	}
+
+	std::vector<std::string> build_calendar() const {
+		std::set<std::string> unique_dates;
+		for (const auto& [ticker, days] : data) {
+			for (const auto& day : days) {
+				unique_dates.insert(day.date);
+			}
+		}
+		return std::vector<std::string>(unique_dates.begin(), unique_dates.end());
+	}
+
+	std::map<std::string, double> build_latest_prices(const std::string& date) const {
+		std::map<std::string, double> latest_prices;
+		for (const auto& ticker : tickers) {
+			double close = get_latest_close(ticker, date);
+			if (std::isfinite(close) && close > 0.0) {
+				latest_prices[ticker] = close;
+			}
+		}
+		return latest_prices;
+	}
+
+	std::optional<size_t> get_bar_index(const std::string& ticker, const std::string& date) const {
+		auto data_it = data.find(ticker);
+		if (data_it == data.end()) {
+			return std::nullopt;
+		}
+
+		const auto& days = data_it->second;
+		auto it = std::lower_bound(days.begin(), days.end(), date,
+			[](const Day& day, const std::string& value) {
+				return day.date < value;
+			});
+
+		if (it == days.end() || it->date != date) {
+			return std::nullopt;
+		}
+
+		return static_cast<size_t>(std::distance(days.begin(), it));
+	}
+
+public:
+	MultiAssetBacktest(const std::vector<std::string>& tickers, const Portfolio& portfolio)
+		: tickers(tickers), portfolio(portfolio) {
+		for (const auto& ticker : tickers) {
+			data[ticker] = load_days(ticker);
+		}
+	}
+
+	bool has_bar(const std::string& ticker, const std::string& date) const {
+		return get_bar(ticker, date) != nullptr;
+	}
+
+	const Day* get_bar(const std::string& ticker, const std::string& date) const {
+		auto data_it = data.find(ticker);
+		if (data_it == data.end()) {
+			return nullptr;
+		}
+
+		const auto& days = data_it->second;
+		auto it = std::lower_bound(days.begin(), days.end(), date,
+			[](const Day& day, const std::string& value) {
+				return day.date < value;
+			});
+
+		if (it != days.end() && it->date == date) {
+			return &(*it);
+		}
+		return nullptr;
+	}
+
+	double get_latest_close(const std::string& ticker, const std::string& date) const {
+		auto data_it = data.find(ticker);
+		if (data_it == data.end()) {
+			return std::numeric_limits<double>::quiet_NaN();
+		}
+
+		const auto& days = data_it->second;
+		auto it = std::upper_bound(days.begin(), days.end(), date,
+			[](const std::string& value, const Day& day) {
+				return value < day.date;
+			});
+
+		if (it == days.begin()) {
+			return std::numeric_limits<double>::quiet_NaN();
+		}
+
+		--it;
+		return it->close;
+	}
+
+	void run_with_predictions(
+		const PredictionLoader& predictions,
+		double buy_threshold,
+		int max_hold_days,
+		double stop_loss_pct,
+		double target_profit_pct
+	) {
+		equity_curve.clear();
+		auto calendar = build_calendar();
+
+		// A shared calendar is required for a true multi-stock backtest: all exits,
+		// entries, and mark-to-market values must be processed once per date so one
+		// Portfolio produces exactly one equity curve.
+		for (size_t calendar_index = 0; calendar_index < calendar.size(); ++calendar_index) {
+			const std::string& date = calendar[calendar_index];
+			auto latest_prices = build_latest_prices(date);
+
+			for (const auto& ticker : tickers) {
+				if (!portfolio.in_position(ticker)) {
+					continue;
+				}
+
+				const Day* day = get_bar(ticker, date);
+				bool exited = false;
+				if (day != nullptr) {
+					double stop_price = portfolio.current_stop_price(ticker);
+					double target_price = portfolio.current_target_price(ticker);
+
+					if (stop_price > 0.0 && day->low <= stop_price) {
+						portfolio.sell(ticker, stop_price, date, static_cast<int>(calendar_index), "stop_loss");
+						exited = true;
+					}
+					else if (std::isfinite(target_price) && day->high >= target_price) {
+						portfolio.sell(ticker, target_price, date, static_cast<int>(calendar_index), "take_profit");
+						exited = true;
+					}
+				}
+
+				if (!exited && max_hold_days > 0 && portfolio.current_entry_index(ticker) >= 0 &&
+					static_cast<int>(calendar_index) - portfolio.current_entry_index(ticker) >= max_hold_days) {
+					auto price_it = latest_prices.find(ticker);
+					if (price_it != latest_prices.end()) {
+						portfolio.sell(ticker, price_it->second, date, static_cast<int>(calendar_index), "max_hold");
+					}
+				}
+			}
+
+			std::vector<EntryCandidate> candidates;
+			for (const auto& ticker : tickers) {
+				const Day* day = get_bar(ticker, date);
+				if (day == nullptr || portfolio.in_position(ticker)) {
+					continue;
+				}
+
+				auto probability = predictions.get_probability(date, ticker);
+				if (!probability.has_value() || *probability < buy_threshold) {
+					continue;
+				}
+
+				candidates.push_back(EntryCandidate{ ticker, *probability, day->close, date });
+			}
+
+			std::sort(candidates.begin(), candidates.end(),
+				[](const EntryCandidate& a, const EntryCandidate& b) {
+					return a.probability > b.probability;
+				});
+
+			for (const auto& candidate : candidates) {
+				if (portfolio.open_position_count() >= portfolio.max_open_position_count()) {
+					break;
+				}
+
+				double stop_price = stop_loss_pct > 0.0 ? candidate.price * (1.0 - stop_loss_pct) : 0.0;
+				double target_price = target_profit_pct > 0.0 ? candidate.price * (1.0 + target_profit_pct) : std::numeric_limits<double>::infinity();
+				portfolio.buy(candidate.ticker, candidate.price, candidate.date, static_cast<int>(calendar_index), stop_price, target_price);
+			}
+
+			equity_curve.push_back(portfolio.value(latest_prices));
+		}
+	}
+
+	void run_with_strategy(
+		Strategy& strategy,
+		int max_hold_days,
+		double stop_loss_pct,
+		double target_profit_pct
+	) {
+		equity_curve.clear();
+		strategy.reset();
+		auto calendar = build_calendar();
+
+		// This is the same shared-calendar model as the prediction path. The key
+		// point is that all tickers are processed for one date before one portfolio
+		// value is recorded.
+		for (size_t calendar_index = 0; calendar_index < calendar.size(); ++calendar_index) {
+			const std::string& date = calendar[calendar_index];
+			auto latest_prices = build_latest_prices(date);
+
+			for (const auto& ticker : tickers) {
+				if (!portfolio.in_position(ticker)) {
+					continue;
+				}
+
+				const Day* day = get_bar(ticker, date);
+				bool exited = false;
+				if (day != nullptr) {
+					double stop_price = portfolio.current_stop_price(ticker);
+					double target_price = portfolio.current_target_price(ticker);
+
+					if (stop_price > 0.0 && day->low <= stop_price) {
+						portfolio.sell(ticker, stop_price, date, static_cast<int>(calendar_index), "stop_loss");
+						exited = true;
+					}
+					else if (std::isfinite(target_price) && day->high >= target_price) {
+						portfolio.sell(ticker, target_price, date, static_cast<int>(calendar_index), "take_profit");
+						exited = true;
+					}
+				}
+
+				if (!exited && max_hold_days > 0 && portfolio.current_entry_index(ticker) >= 0 &&
+					static_cast<int>(calendar_index) - portfolio.current_entry_index(ticker) >= max_hold_days) {
+					auto price_it = latest_prices.find(ticker);
+					if (price_it != latest_prices.end()) {
+						portfolio.sell(ticker, price_it->second, date, static_cast<int>(calendar_index), "max_hold");
+						exited = true;
+					}
+				}
+
+				auto bar_index = get_bar_index(ticker, date);
+				if (!exited && day != nullptr && bar_index.has_value() &&
+					strategy.generate(data.at(ticker), *bar_index, true) == Signal::SELL) {
+					portfolio.sell(ticker, day->close, date, static_cast<int>(calendar_index), "strategy_sell");
+				}
+			}
+
+			for (const auto& ticker : tickers) {
+				if (portfolio.open_position_count() >= portfolio.max_open_position_count()) {
+					break;
+				}
+
+				const Day* day = get_bar(ticker, date);
+				auto bar_index = get_bar_index(ticker, date);
+				if (day == nullptr || !bar_index.has_value() || portfolio.in_position(ticker)) {
+					continue;
+				}
+
+				if (strategy.generate(data.at(ticker), *bar_index, false) != Signal::BUY) {
+					continue;
+				}
+
+				double stop_price = stop_loss_pct > 0.0 ? day->close * (1.0 - stop_loss_pct) : 0.0;
+				double target_price = target_profit_pct > 0.0 ? day->close * (1.0 + target_profit_pct) : std::numeric_limits<double>::infinity();
+				portfolio.buy(ticker, day->close, date, static_cast<int>(calendar_index), stop_price, target_price);
+			}
+
+			equity_curve.push_back(portfolio.value(latest_prices));
+		}
+	}
+
+	const std::vector<double>& get_equity_curve() const {
+		return equity_curve;
+	}
+
+	const Portfolio& get_portfolio() const {
+		return portfolio;
+	}
+};
+
 class Metrics {
 private:
 	std::vector<double> returns{};
@@ -644,20 +976,10 @@ int main() {
 	double risk_per_trade = 0.01;
 	double max_position_fraction = 0.40;
 	int max_open_positions = 5;
-	Portfolio portfolio(starting_cash, risk_per_trade, max_position_fraction, max_open_positions);
-
 	// Strategy setup:
 	// MomentumStrategy(20) compares recent price action against a 20-day lookback.
 	MomentumStrategy strat(20);
 	//FixedPriceStrategy strat(2.30, 2.75);
-	// ML strategy usage:
-	// PredictionLoader predictions("output/predictions.csv");
-	// MLProbabilityStrategy strat(ticker, predictions, 0.60, 0.40);
-
-	// Backtest setup:
-	// ticker data is loaded from ticker_data/AAPL.json and ticker_data/RR.json.
-	Backtest b(ticker, opt);
-	Backtest rr_backtest(rr_ticker, opt);
 
 	// Swing trade management:
 	// - max_hold_days exits after this many bars in a trade.
@@ -668,37 +990,32 @@ int main() {
 	double stop_loss_pct = 0.05;
 	double target_profit_pct = 0.10;
 
-	std::cout << "Running AAPL swing backtest\n";
+	std::cout << "Running true multi-stock swing backtest for " << ticker << " and " << rr_ticker << "\n";
 	std::cout << "Starting cash: " << starting_cash << "\n";
 	std::cout << "Risk per trade: " << risk_per_trade * 100.0 << "%\n";
 	std::cout << "Max position fraction: " << max_position_fraction * 100.0 << "%\n";
 	std::cout << "Max open positions: " << max_open_positions << "\n";
 	std::cout << "Stop loss: " << stop_loss_pct * 100.0 << "%, target: " << target_profit_pct * 100.0 << "%, max hold: " << max_hold_days << " days\n";
 
-	b.clear();
-	b.run_backtest(portfolio, strat, regime, max_hold_days, stop_loss_pct, target_profit_pct);
-
-	Metrics m3(b.get_equity_curve());
-	m3.print_metrics(b.get_equity_curve());
-
-	// RR is loaded to show the same portfolio API can support multiple tickers.
-	// Do not run a second independent Backtest here: one shared Portfolio should
-	// have one equity curve, recorded by a shared calendar loop across tickers.
-	std::cout << "RR rows loaded for multi-ticker support: " << rr_backtest.get_time_series().size() << "\n";
-
-	TradeMetrics::print(portfolio.get_trades());
-	std::cout << "Closed trades: " << portfolio.get_trades().size() << "\n";
-
-	// CSV includes stop_price, target_price, entry/exit index, and exit_reason.
-	TradeMetrics::save_csv(portfolio.get_trades(), "output/trades.csv");
+	// True multi-stock backtest:
+	// MultiAssetBacktest builds one shared calendar across all tickers and records
+	// one portfolio equity value per date.
+	Portfolio multi_portfolio(starting_cash, risk_per_trade, max_position_fraction, max_open_positions);
+	MultiAssetBacktest multi({ ticker, rr_ticker }, multi_portfolio);
+	multi.run_with_strategy(strat, max_hold_days, stop_loss_pct, target_profit_pct);
+	Metrics multi_metrics(multi.get_equity_curve());
+	multi_metrics.print_metrics(multi.get_equity_curve());
+	TradeMetrics::print(multi.get_portfolio().get_trades());
+	std::cout << "Closed trades: " << multi.get_portfolio().get_trades().size() << "\n";
+	TradeMetrics::save_csv(multi.get_portfolio().get_trades(), "output/trades.csv");
 
 	// ML dataset export:
 	// Features use only past/current data; labels use future OHLC for the same dates.
 	// The exporter joins rows by date + ticker and writes only rows with both sides.
-	auto features = FeatureEngine::generate(ticker, b.get_time_series());
-	auto labels = LabelEngine::generate(ticker, b.get_time_series(), target_profit_pct, stop_loss_pct, max_hold_days);
-	size_t ml_rows = MLDataExporter::save_csv(features, labels);
-	std::cout << "ML rows exported: " << ml_rows << " to output/ml_dataset.csv\n";
+	//auto features = FeatureEngine::generate(ticker, b.get_time_series());
+	//auto labels = LabelEngine::generate(ticker, b.get_time_series(), target_profit_pct, stop_loss_pct, max_hold_days);
+	//size_t ml_rows = MLDataExporter::save_csv(features, labels);
+	//std::cout << "ML rows exported: " << ml_rows << " to output/ml_dataset.csv\n";
 
 	// Prediction import example:
 	// PredictionLoader predictions("output/predictions.csv");
@@ -706,6 +1023,13 @@ int main() {
 	// if (probability.has_value()) {
 	// 	std::cout << "Prediction probability: " << *probability << "\n";
 	// }
+
+	// ML-ranked multi-stock example:
+	// PredictionLoader predictions("output/predictions.csv");
+	// MultiAssetBacktest ml_multi({ ticker, rr_ticker }, Portfolio(starting_cash, risk_per_trade, max_position_fraction, max_open_positions));
+	// ml_multi.run_with_predictions(predictions, 0.60, max_hold_days, stop_loss_pct, target_profit_pct);
+	// Metrics ml_metrics(ml_multi.get_equity_curve());
+	// ml_metrics.print_metrics(ml_multi.get_equity_curve());
 	
 
 	return 0;
