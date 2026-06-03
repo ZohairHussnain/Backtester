@@ -569,6 +569,20 @@ private:
 		return static_cast<size_t>(std::distance(days.begin(), it));
 	}
 
+	static bool date_in_range(const std::string& date, const std::string& start_date, const std::string& end_date) {
+		return (start_date.empty() || date >= start_date) && (end_date.empty() || date <= end_date);
+	}
+
+	static std::pair<std::string, std::string> regime_range(Regimes regime) {
+		if (regime == Regimes::STRESS) {
+			return { "2000-01-01", "2009-12-31" };
+		}
+		if (regime == Regimes::EASY) {
+			return { "2010-01-01", "2019-12-31" };
+		}
+		return { "2020-01-01", "2026-05-31" };
+	}
+
 public:
 	MultiAssetBacktest(const std::vector<std::string>& tickers, const Portfolio& portfolio)
 		: tickers(tickers), portfolio(portfolio) {
@@ -624,7 +638,9 @@ public:
 		double buy_threshold,
 		int max_hold_days,
 		double stop_loss_pct,
-		double target_profit_pct
+		double target_profit_pct,
+		const std::string& start_date = "",
+		const std::string& end_date = ""
 	) {
 		equity_curve.clear();
 		auto calendar = build_calendar();
@@ -634,6 +650,9 @@ public:
 		// Portfolio produces exactly one equity curve.
 		for (size_t calendar_index = 0; calendar_index < calendar.size(); ++calendar_index) {
 			const std::string& date = calendar[calendar_index];
+			if (!date_in_range(date, start_date, end_date)) {
+				continue;
+			}
 			auto latest_prices = build_latest_prices(date);
 
 			for (const auto& ticker : tickers) {
@@ -700,11 +719,25 @@ public:
 		}
 	}
 
+	void run_with_predictions(
+		const PredictionLoader& predictions,
+		double buy_threshold,
+		Regimes regime,
+		int max_hold_days,
+		double stop_loss_pct,
+		double target_profit_pct
+	) {
+		auto [start_date, end_date] = regime_range(regime);
+		run_with_predictions(predictions, buy_threshold, max_hold_days, stop_loss_pct, target_profit_pct, start_date, end_date);
+	}
+
 	void run_with_strategy(
 		Strategy& strategy,
 		int max_hold_days,
 		double stop_loss_pct,
-		double target_profit_pct
+		double target_profit_pct,
+		const std::string& start_date = "",
+		const std::string& end_date = ""
 	) {
 		equity_curve.clear();
 		strategy.reset();
@@ -715,6 +748,9 @@ public:
 		// value is recorded.
 		for (size_t calendar_index = 0; calendar_index < calendar.size(); ++calendar_index) {
 			const std::string& date = calendar[calendar_index];
+			if (!date_in_range(date, start_date, end_date)) {
+				continue;
+			}
 			auto latest_prices = build_latest_prices(date);
 
 			for (const auto& ticker : tickers) {
@@ -776,6 +812,17 @@ public:
 
 			equity_curve.push_back(portfolio.value(latest_prices));
 		}
+	}
+
+	void run_with_strategy(
+		Strategy& strategy,
+		Regimes regime,
+		int max_hold_days,
+		double stop_loss_pct,
+		double target_profit_pct
+	) {
+		auto [start_date, end_date] = regime_range(regime);
+		run_with_strategy(strategy, max_hold_days, stop_loss_pct, target_profit_pct, start_date, end_date);
 	}
 
 	const std::vector<double>& get_equity_curve() const {
@@ -995,6 +1042,7 @@ int main() {
 	std::cout << "Risk per trade: " << risk_per_trade * 100.0 << "%\n";
 	std::cout << "Max position fraction: " << max_position_fraction * 100.0 << "%\n";
 	std::cout << "Max open positions: " << max_open_positions << "\n";
+	std::cout << "Regime: MODERN (2020-01-01 to 2026-05-31)\n";
 	std::cout << "Stop loss: " << stop_loss_pct * 100.0 << "%, target: " << target_profit_pct * 100.0 << "%, max hold: " << max_hold_days << " days\n";
 
 	// True multi-stock backtest:
@@ -1002,7 +1050,7 @@ int main() {
 	// one portfolio equity value per date.
 	Portfolio multi_portfolio(starting_cash, risk_per_trade, max_position_fraction, max_open_positions);
 	MultiAssetBacktest multi({ ticker, rr_ticker }, multi_portfolio);
-	multi.run_with_strategy(strat, max_hold_days, stop_loss_pct, target_profit_pct);
+	multi.run_with_strategy(strat, regime, max_hold_days, stop_loss_pct, target_profit_pct);
 	Metrics multi_metrics(multi.get_equity_curve());
 	multi_metrics.print_metrics(multi.get_equity_curve());
 	TradeMetrics::print(multi.get_portfolio().get_trades());
@@ -1027,7 +1075,7 @@ int main() {
 	// ML-ranked multi-stock example:
 	// PredictionLoader predictions("output/predictions.csv");
 	// MultiAssetBacktest ml_multi({ ticker, rr_ticker }, Portfolio(starting_cash, risk_per_trade, max_position_fraction, max_open_positions));
-	// ml_multi.run_with_predictions(predictions, 0.60, max_hold_days, stop_loss_pct, target_profit_pct);
+	// ml_multi.run_with_predictions(predictions, 0.60, regime, max_hold_days, stop_loss_pct, target_profit_pct);
 	// Metrics ml_metrics(ml_multi.get_equity_curve());
 	// ml_metrics.print_metrics(ml_multi.get_equity_curve());
 	
