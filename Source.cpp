@@ -17,6 +17,7 @@
 #include "FeatureEngine.h"
 #include "LabelEngine.h"
 #include "MLDataExporter.h"
+#include "PredictionLoader.h"
 
 using json = nlohmann::json;
 using response = cpr::Response;
@@ -609,6 +610,13 @@ int main() {
 	auto labels = LabelEngine::generate(ticker, b.get_time_series(), target_profit_pct, stop_loss_pct, max_hold_days);
 	size_t ml_rows = MLDataExporter::save_csv(features, labels);
 	std::cout << "ML rows exported: " << ml_rows << " to output/ml_dataset.csv\n";
+
+	// Prediction import example:
+	// PredictionLoader predictions("output/predictions.csv");
+	// auto probability = predictions.get_probability("2024-01-05", ticker);
+	// if (probability.has_value()) {
+	// 	std::cout << "Prediction probability: " << *probability << "\n";
+	// }
 	
 
 	return 0;
