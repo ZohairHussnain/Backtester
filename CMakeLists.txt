@@ -20,3 +20,16 @@ target_link_libraries(BackTester PRIVATE
     cpr::cpr
     nlohmann_json::nlohmann_json
 )
+
+# Test executable
+enable_testing()
+
+add_executable(BackTesterTests
+    Tests.cpp
+)
+
+target_link_libraries(BackTesterTests PRIVATE
+    nlohmann_json::nlohmann_json
+)
+
+add_test(NAME BackTesterTests COMMAND BackTesterTests)

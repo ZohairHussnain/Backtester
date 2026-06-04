@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cmake --build build)"
+      "Bash(cmake --build build)",
+      "Bash(./build/Debug/BackTester.exe:*)",
+      "Bash(cmake:*)",
+      "Bash(./build/Debug/BackTesterTests.exe:*)",
+      "Bash(ctest:*)"
     ]
   }
 }
