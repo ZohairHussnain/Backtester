@@ -1056,6 +1056,204 @@ void test_multi_prediction_entry_order() {
 }
 
 // ===========================================================================
+// M. End-to-End Smoke Tests
+// ===========================================================================
+
+void test_e2e_single_ticker_synthetic() {
+	// 20 bars of synthetic data with a clear pattern:
+	// Bars 0-9: price rises from 100 to 109 (each bar +1)
+	// Bars 10-19: price falls from 110 to 101 (each bar -1)
+	// MomentumStrategy(3) should BUY during the rise and SELL during the fall.
+	std::vector<Day> days;
+	for (int i = 0; i < 10; ++i) {
+		double price = 100.0 + i;
+		days.push_back(make_day(i, price, price + 0.5, price - 0.5, price));
+	}
+	for (int i = 10; i < 20; ++i) {
+		double price = 110.0 - (i - 9);
+		days.push_back(make_day(i, price, price + 0.5, price - 0.5, price));
+	}
+
+	MomentumStrategy strat(3);
+	Portfolio p(10000, 0.01, 0.40, 5);
+	Backtest bt("TEST", days);
+	bt.run_backtest(p, strat, Regimes::MODERN, 0, 0.05, 0.10);
+
+	// Verify structural properties:
+	// 1. Equity curve should have entries for bars 2..19 = 18 points
+	ASSERT_EQ(static_cast<int>(bt.get_equity_curve().size()), 18);
+
+	// 2. At least one trade should have been opened and closed
+	auto& trades = p.get_trades();
+	ASSERT_TRUE(!trades.empty());
+
+	// 3. All trades should have valid exit reasons
+	for (auto& t : trades) {
+		ASSERT_TRUE(
+			t.exit_reason == "stop_loss" ||
+			t.exit_reason == "take_profit" ||
+			t.exit_reason == "max_hold" ||
+			t.exit_reason == "strategy_sell"
+		);
+	}
+
+	// 4. Final equity should be close to starting (small moves, fees eat into PnL)
+	double final_equity = bt.get_equity_curve().back();
+	ASSERT_TRUE(final_equity > 9000.0 && final_equity < 11000.0);
+
+	// 5. Entry prices should include slippage (above raw close)
+	for (auto& t : trades) {
+		ASSERT_TRUE(t.entry_price > 100.0); // slippage pushes above the raw close
+	}
+
+	// 6. Exit prices should include slippage (below raw close for sell)
+	for (auto& t : trades) {
+		if (t.exit_reason == "strategy_sell" || t.exit_reason == "max_hold") {
+			// Exit price has downward slippage applied
+			ASSERT_TRUE(t.exit_price < 110.0); // below the peak raw close
+		}
+	}
+
+	// 7. Fees should be positive for every trade
+	for (auto& t : trades) {
+		ASSERT_TRUE(t.fees > 0.0);
+	}
+
+	// 8. Metrics should be computable without error
+	Metrics m(bt.get_equity_curve());
+	ASSERT_TRUE(std::isfinite(m.getCAGR()));
+	ASSERT_TRUE(std::isfinite(m.get_sharpe()));
+	ASSERT_TRUE(m.max_drawdown() <= 0.0);
+}
+
+void test_e2e_multi_ticker_synthetic() {
+	// Two tickers: A rises steadily, B falls steadily.
+	// MomentumStrategy(2) should BUY A and SELL/skip B.
+	std::vector<Day> days_a, days_b;
+	for (int i = 0; i < 15; ++i) {
+		double pa = 100.0 + i * 2.0;  // 100, 102, 104, ...
+		double pb = 200.0 - i * 2.0;  // 200, 198, 196, ...
+		days_a.push_back(make_day(i, pa, pa + 1, pa - 1, pa));
+		days_b.push_back(make_day(i, pb, pb + 1, pb - 1, pb));
+	}
+
+	std::map<std::string, std::vector<Day>> data;
+	data["RISE"] = days_a;
+	data["FALL"] = days_b;
+
+	Portfolio p_port(10000, 0.01, 0.40, 2);
+	MultiAssetBacktest multi({"RISE", "FALL"}, std::move(data), p_port);
+	MomentumStrategy strat(2);
+	multi.run_with_strategy(strat, 10, 0.05, 0.20, "2020-01-01", "2020-01-15");
+
+	// 1. Equity curve should cover all 15 dates
+	ASSERT_EQ(static_cast<int>(multi.get_equity_curve().size()), 15);
+
+	// 2. Some trades should have happened
+	auto& trades = multi.get_portfolio().get_trades();
+	ASSERT_TRUE(!trades.empty());
+
+	// 3. Final equity should be reasonable
+	double final_eq = multi.get_equity_curve().back();
+	ASSERT_TRUE(final_eq > 0.0);
+
+	// 4. Metrics computable
+	Metrics m(multi.get_equity_curve());
+	ASSERT_TRUE(std::isfinite(m.getCAGR()));
+	ASSERT_TRUE(std::isfinite(m.get_sharpe()));
+}
+
+void test_e2e_ml_pipeline_round_trip() {
+	// Generate features + labels from synthetic data, export to CSV, verify row count.
+	auto days = make_ramp_days(230, 100.0, 150.0); // 230 bars, rising
+	std::string ticker = "SYNTH";
+
+	auto features = FeatureEngine::generate(ticker, days);
+	// 230 - 200 + 1 = 31 feature rows
+	ASSERT_EQ(static_cast<int>(features.size()), 31);
+
+	auto labels = LabelEngine::generate(ticker, days, 0.10, 0.05, 5);
+	// Labels can be generated for indices 199..(230-5-1)=224 -> 26 labels
+	ASSERT_TRUE(!labels.empty());
+
+	// Export should join by date+ticker
+	size_t rows = MLDataExporter::save_csv(features, labels, "test_data/e2e_ml.csv");
+	ASSERT_TRUE(rows > 0);
+	// Rows should be <= min(features, labels) since it's an inner join
+	ASSERT_TRUE(rows <= features.size());
+	ASSERT_TRUE(rows <= labels.size());
+
+	// Verify the CSV was actually written
+	std::ifstream f("test_data/e2e_ml.csv");
+	ASSERT_TRUE(f.is_open());
+	int line_count = 0;
+	std::string line;
+	while (std::getline(f, line)) line_count++;
+	// header + data rows
+	ASSERT_EQ(line_count, static_cast<int>(rows) + 1);
+}
+
+void test_e2e_prediction_round_trip() {
+	// Write predictions -> load -> use in MultiAssetBacktest -> verify trades
+	auto days = make_ramp_days(20, 100.0, 120.0);
+	std::map<std::string, std::vector<Day>> data;
+	data["X"] = days;
+
+	// Write predictions: high probability for first few dates
+	std::ofstream f("test_data/e2e_pred.csv");
+	f << "date,ticker,probability\n";
+	for (int i = 0; i < 20; ++i) {
+		double prob = (i < 5) ? 0.90 : 0.30;
+		f << make_date(i) << ",X," << prob << "\n";
+	}
+	f.close();
+
+	PredictionLoader loader("test_data/e2e_pred.csv");
+
+	// Verify predictions loaded correctly
+	auto prob0 = loader.get_probability(make_date(0), "X");
+	ASSERT_TRUE(prob0.has_value());
+	ASSERT_NEAR(*prob0, 0.90, 1e-9);
+	auto prob10 = loader.get_probability(make_date(10), "X");
+	ASSERT_TRUE(prob10.has_value());
+	ASSERT_NEAR(*prob10, 0.30, 1e-9);
+
+	// Run backtest with predictions
+	Portfolio p(10000, 0.01, 0.40, 1);
+	MultiAssetBacktest multi({"X"}, std::move(data), p);
+	multi.run_with_predictions(loader, 0.60, 5, 0.05, 0.10, make_date(0), make_date(19));
+
+	ASSERT_EQ(static_cast<int>(multi.get_equity_curve().size()), 20);
+	ASSERT_TRUE(multi.get_equity_curve().back() > 0.0);
+}
+
+void test_e2e_determinism() {
+	// Running the same backtest twice should produce identical results.
+	auto run_backtest = []() {
+		auto days = make_ramp_days(20, 100.0, 130.0);
+		MomentumStrategy strat(3);
+		Portfolio p(10000, 0.01, 0.40, 5);
+		Backtest bt("DET", days);
+		bt.run_backtest(p, strat, Regimes::MODERN, 5, 0.05, 0.10);
+		return std::make_pair(bt.get_equity_curve(), p.get_trades());
+	};
+
+	auto [curve1, trades1] = run_backtest();
+	auto [curve2, trades2] = run_backtest();
+
+	ASSERT_EQ(static_cast<int>(curve1.size()), static_cast<int>(curve2.size()));
+	for (size_t i = 0; i < curve1.size(); ++i) {
+		ASSERT_NEAR(curve1[i], curve2[i], 1e-9);
+	}
+	ASSERT_EQ(static_cast<int>(trades1.size()), static_cast<int>(trades2.size()));
+	for (size_t i = 0; i < trades1.size(); ++i) {
+		ASSERT_NEAR(trades1[i].entry_price, trades2[i].entry_price, 1e-9);
+		ASSERT_NEAR(trades1[i].exit_price, trades2[i].exit_price, 1e-9);
+		ASSERT_NEAR(trades1[i].pnl(), trades2[i].pnl(), 1e-9);
+	}
+}
+
+// ===========================================================================
 // Main
 // ===========================================================================
 
@@ -1172,6 +1370,13 @@ int main() {
 	RUN_TEST(test_multi_shared_calendar);
 	RUN_TEST(test_multi_strategy_entry_order_alphabetical);
 	RUN_TEST(test_multi_prediction_entry_order);
+
+	std::cout << "\n-- M. End-to-End Smoke --\n";
+	RUN_TEST(test_e2e_single_ticker_synthetic);
+	RUN_TEST(test_e2e_multi_ticker_synthetic);
+	RUN_TEST(test_e2e_ml_pipeline_round_trip);
+	RUN_TEST(test_e2e_prediction_round_trip);
+	RUN_TEST(test_e2e_determinism);
 
 	std::cout << "\n=== Results: " << tests_passed << "/" << tests_run << " passed";
 	if (tests_failed > 0) {
