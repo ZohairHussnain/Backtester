@@ -40,4 +40,4 @@ BackTester is a local, offline stock strategy backtesting engine written in C++2
 
 - **Not a risk analytics platform.** It computes a small fixed set of metrics. There is no Value-at-Risk, no Monte Carlo simulation, no correlation analysis, no benchmark comparison, no rolling-window statistics.
 
-- **Not tested.** There is no test suite -- no unit tests, no integration tests, no regression tests. Correctness is verified by inspection and by comparing output to expected values manually.
+- **Tested with a lightweight suite.** The project includes 186 assertions across 13 test sections covering unit tests (Trade, Portfolio, strategies, metrics, fees), component tests (FeatureEngine, LabelEngine, PredictionLoader, MLDataExporter), integration tests (Backtest, MultiAssetBacktest), and end-to-end smoke tests (synthetic single/multi-ticker runs, ML pipeline round-trip, determinism). Tests use synthetic in-memory data and a zero-dependency assert harness -- no external test framework is required.
