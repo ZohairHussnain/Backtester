@@ -10,5 +10,13 @@ build/
 x64/
 out/
 
+# Generated ML artifacts
+python/models/
+output/predictions.csv
+output/predictions_all.csv
+output/ml_metrics.csv
+
+# Test data
+test_data/
 
 CLAUDE.md
