@@ -47,18 +47,36 @@ public:
 				target_price = entry_price * (1.0 + target_pct);
 				stop_price = entry_price * (1.0 - stop_pct);
 
+				bool resolved = false;
 				for (size_t j = i + 1; j <= i + max_horizon_days; ++j) {
 					bool stop_hit = days[j].low <= stop_price;
 					bool target_hit = days[j].high >= target_price;
 
+					if (stop_hit && target_hit) {
+						double dist_to_stop = std::abs(days[j].open - stop_price);
+						double dist_to_target = std::abs(days[j].open - target_price);
+						label = dist_to_stop <= dist_to_target ? 0 : 1;
+						resolved = true;
+						break;
+					}
 					if (stop_hit) {
 						label = 0;
+						resolved = true;
 						break;
 					}
 					if (target_hit) {
 						label = 1;
+						resolved = true;
 						break;
 					}
+				}
+
+				// Neither stop nor target hit within the horizon — label based
+				// on whether the position would have been profitable at the
+				// close of the last bar in the window.
+				if (!resolved) {
+					double exit_close = days[i + max_horizon_days].close;
+					label = exit_close > entry_price ? 1 : 0;
 				}
 			}
 

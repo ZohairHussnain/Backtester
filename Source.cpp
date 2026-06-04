@@ -125,6 +125,16 @@ public:
 		if (in_position(ticker) || open_position_count() >= max_open_positions || price <= 0 || risk_per_trade <= 0 || max_position_fraction <= 0)
 			return;
 		double execution_price = price * (1.0 + slippage);
+		// Rescale stop/target so percentages are relative to the actual execution
+		// price rather than the raw price the caller used to compute them.
+		if (price > 0.0 && stop_price > 0.0) {
+			double stop_pct = 1.0 - stop_price / price;
+			stop_price = execution_price * (1.0 - stop_pct);
+		}
+		if (price > 0.0 && std::isfinite(target_price)) {
+			double target_pct = target_price / price - 1.0;
+			target_price = execution_price * (1.0 + target_pct);
+		}
 		if (stop_price >= execution_price)
 			return;
 
@@ -213,7 +223,7 @@ public:
 		if (i < lookback)
 			return Signal::HOLD;
 
-		double now = time_series[i - 1].close;
+		double now = time_series[i].close;
 		double past = time_series[i - lookback].close;
 
 		if (now > past) return Signal::BUY;
@@ -404,7 +414,6 @@ public:
 		for (size_t i = 2; i < time_series.size(); i++) {
 			if (!in_regime(time_series[i].date, regime))     continue;
 			if (!in_regime(time_series[i - 1].date, regime)) continue;
-			if (!in_regime(time_series[i - 2].date, regime)) continue;
 			signal = s.generate(time_series, i - 1, p.in_position(ticker));
 			price = time_series[i].close;
 			bool exited_today = false;
@@ -790,11 +799,10 @@ public:
 				}
 			}
 
+			// Collect entry candidates, then sort alphabetically so results
+			// are deterministic regardless of the order tickers were passed in.
+			std::vector<EntryCandidate> strategy_candidates;
 			for (const auto& ticker : tickers) {
-				if (portfolio.open_position_count() >= portfolio.max_open_position_count()) {
-					break;
-				}
-
 				const Day* day = get_bar(ticker, date);
 				auto bar_index = get_bar_index(ticker, date);
 				if (day == nullptr || !bar_index.has_value() || portfolio.in_position(ticker)) {
@@ -805,9 +813,22 @@ public:
 					continue;
 				}
 
-				double stop_price = stop_loss_pct > 0.0 ? day->close * (1.0 - stop_loss_pct) : 0.0;
-				double target_price = target_profit_pct > 0.0 ? day->close * (1.0 + target_profit_pct) : std::numeric_limits<double>::infinity();
-				portfolio.buy(ticker, day->close, date, static_cast<int>(calendar_index), stop_price, target_price);
+				strategy_candidates.push_back(EntryCandidate{ ticker, 0.0, day->close, date });
+			}
+
+			std::sort(strategy_candidates.begin(), strategy_candidates.end(),
+				[](const EntryCandidate& a, const EntryCandidate& b) {
+					return a.ticker < b.ticker;
+				});
+
+			for (const auto& candidate : strategy_candidates) {
+				if (portfolio.open_position_count() >= portfolio.max_open_position_count()) {
+					break;
+				}
+
+				double stop_price = stop_loss_pct > 0.0 ? candidate.price * (1.0 - stop_loss_pct) : 0.0;
+				double target_price = target_profit_pct > 0.0 ? candidate.price * (1.0 + target_profit_pct) : std::numeric_limits<double>::infinity();
+				portfolio.buy(candidate.ticker, candidate.price, candidate.date, static_cast<int>(calendar_index), stop_price, target_price);
 			}
 
 			equity_curve.push_back(portfolio.value(latest_prices));
@@ -840,6 +861,7 @@ private:
 	double drawdown{};
 	double CAGR{};
 	double sharpe{};
+	int trading_days_override = 0;
 	void calc_daily_returns(const std::vector<double>& equity_curve) {
 		returns.clear();
 		for (size_t i = 1; i < equity_curve.size(); i++) {
@@ -866,17 +888,19 @@ private:
 			return;
 		}
 		double initial = equity_curve.front();
-		double final = equity_curve.back();
+		double final_val = equity_curve.back();
 
-		if (initial <= 0 || final <= 0) {
+		if (initial <= 0 || final_val <= 0) {
 			CAGR = 0.0;
 			return;
 		}
 
-		double days = static_cast<double>(equity_curve.size());
+		double days = trading_days_override > 0
+			? static_cast<double>(trading_days_override)
+			: static_cast<double>(equity_curve.size());
 		double years = days / 252.0;
 
-		CAGR = std::pow(final / initial, 1.0 / years) - 1.0;
+		CAGR = std::pow(final_val / initial, 1.0 / years) - 1.0;
 	}
 	void calc_sharpe() {
 		if (returns.size() < 2) {
@@ -918,6 +942,13 @@ private:
 	}
 public:
 	Metrics(const std::vector<double>& equity_curve) {
+		calc_daily_returns(equity_curve);
+		calc_max_drawdown(equity_curve);
+		calc_CAGR(equity_curve);
+		calc_sharpe();
+	}
+	Metrics(const std::vector<double>& equity_curve, int trading_days)
+		: trading_days_override(trading_days) {
 		calc_daily_returns(equity_curve);
 		calc_max_drawdown(equity_curve);
 		calc_CAGR(equity_curve);
