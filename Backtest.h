@@ -108,12 +108,12 @@ public:
 			if (!in_regime(time_series[i].date, regime))     continue;
 			if (!in_regime(time_series[i - 1].date, regime)) continue;
 			signal = s.generate(time_series, i - 1, p.in_position(ticker));
-			price = time_series[i].close;
+			const Day& day = time_series[i];
+			int index = static_cast<int>(i);
+			p.set_latest_prices({ { ticker, day.close } });
 			bool exited_today = false;
 
 			if (p.in_position(ticker)) {
-				const Day& day = time_series[i];
-				int index = static_cast<int>(i);
 				double stop_price = p.current_stop_price(ticker);
 				double target_price = p.current_target_price(ticker);
 
@@ -126,23 +126,24 @@ public:
 					exited_today = true;
 				}
 				else if (max_hold_days > 0 && p.current_entry_index(ticker) >= 0 && index - p.current_entry_index(ticker) >= max_hold_days) {
-					p.sell(ticker, price, day.date, index, "max_hold");
+					p.sell(ticker, day.close, day.date, index, "max_hold");
 					exited_today = true;
 				}
 				else if (signal == Signal::SELL) {
-					p.sell(ticker, price, day.date, index, "strategy_sell");
+					p.sell(ticker, day.close, day.date, index, "strategy_sell");
 					exited_today = true;
-					//std::cout << "SELL @" << price << std::endl;
 				}
 			}
 
+			// Signal from bar i-1, enter at bar i open (matches LabelEngine's
+			// entry_price = days[i+1].open assumption).
 			if (signal == Signal::BUY && !p.in_position(ticker) && !exited_today) {
-				double stop_price = stop_loss_pct > 0.0 ? price * (1.0 - stop_loss_pct) : 0.0;
-				double target_price = target_profit_pct > 0.0 ? price * (1.0 + target_profit_pct) : std::numeric_limits<double>::infinity();
-				p.buy(ticker, price, time_series[i].date, static_cast<int>(i), stop_price, target_price);
-				//std::cout << "BUY @" << price << std::endl;
+				double entry_price = day.open;
+				double stop_price = stop_loss_pct > 0.0 ? entry_price * (1.0 - stop_loss_pct) : 0.0;
+				double target_price = target_profit_pct > 0.0 ? entry_price * (1.0 + target_profit_pct) : std::numeric_limits<double>::infinity();
+				p.buy(ticker, entry_price, day.date, index, stop_price, target_price);
 			}
-			equity_curve.push_back(p.value({ { ticker, price } }));
+			equity_curve.push_back(p.value({ { ticker, day.close } }));
 		}
 	}
 	void print_equity_curve() {

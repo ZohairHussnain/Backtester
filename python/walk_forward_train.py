@@ -23,6 +23,8 @@ from sklearn.metrics import (
     f1_score,
     brier_score_loss,
 )
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 
@@ -46,6 +48,7 @@ FEATURE_COLS = [
 ]
 
 MIN_TRAIN_YEARS = 4  # require at least 4 years of training data before first test fold
+PURGE_TRADING_DAYS = 20  # must equal max_horizon_days used in LabelEngine
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +62,7 @@ def load_data(path: Path) -> pd.DataFrame:
 
     df = pd.read_csv(path)
     df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
+    df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
     df = df.dropna(subset=FEATURE_COLS + ["label"])
 
     print(f"Loaded {len(df)} rows from {path}")
@@ -74,9 +77,16 @@ def load_data(path: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def build_folds(df: pd.DataFrame) -> list[dict]:
-    """Build expanding-window walk-forward folds. Each test set is one calendar year."""
+    """Build expanding-window walk-forward folds with per-ticker row-based purge.
+
+    For each fold, the last PURGE_TRADING_DAYS rows per ticker before the test
+    period are removed from training. This guarantees that no training label's
+    forward-looking window can overlap with the test period, regardless of
+    calendar gaps, holidays, or missing data.
+    """
     df["year"] = df["date"].dt.year
     years = sorted(df["year"].unique())
+    tickers = sorted(df["ticker"].unique())
 
     if len(years) < MIN_TRAIN_YEARS + 1:
         print(f"ERROR: Need at least {MIN_TRAIN_YEARS + 1} years of data, got {len(years)}")
@@ -85,23 +95,61 @@ def build_folds(df: pd.DataFrame) -> list[dict]:
     folds = []
     for i in range(MIN_TRAIN_YEARS, len(years)):
         test_year = years[i]
-        train_mask = df["year"] < test_year
         test_mask = df["year"] == test_year
+        pre_test_mask = df["year"] < test_year
 
-        if train_mask.sum() == 0 or test_mask.sum() == 0:
+        if pre_test_mask.sum() == 0 or test_mask.sum() == 0:
             continue
+
+        # Per-ticker purge: for each ticker, find rows before the test period
+        # and remove the last PURGE_TRADING_DAYS of them.
+        purge_indices = set()
+        for ticker in tickers:
+            ticker_pre = df.index[(df["ticker"] == ticker) & pre_test_mask]
+            if len(ticker_pre) <= PURGE_TRADING_DAYS:
+                # Not enough rows — purge all of this ticker's pre-test data
+                purge_indices.update(ticker_pre)
+            else:
+                purge_indices.update(ticker_pre[-PURGE_TRADING_DAYS:])
+
+        train_mask = pre_test_mask & ~df.index.isin(purge_indices)
+
+        if train_mask.sum() == 0:
+            continue
+
+        train_idx = df.index[train_mask]
+        test_idx = df.index[test_mask]
+        rows_purged = len(purge_indices)
+        original_train = int(pre_test_mask.sum())
+
+        # --- Assertions ---
+        max_train_date = df.loc[train_idx, "date"].max()
+        min_test_date = df.loc[test_idx, "date"].min()
+        assert max_train_date < min_test_date, (
+            f"Fold {len(folds)+1}: train date {max_train_date} >= test date {min_test_date}"
+        )
+        assert len(set(train_idx) & set(test_idx)) == 0, (
+            f"Fold {len(folds)+1}: train/test indices overlap"
+        )
+        # Verify no purged row survived in train
+        assert len(set(train_idx) & purge_indices) == 0, (
+            f"Fold {len(folds)+1}: purged rows leaked into training set"
+        )
 
         folds.append({
             "fold": len(folds) + 1,
             "test_year": test_year,
-            "train_idx": df.index[train_mask],
-            "test_idx": df.index[test_mask],
+            "train_idx": train_idx,
+            "test_idx": test_idx,
         })
 
-    print(f"\nBuilt {len(folds)} walk-forward folds:")
-    for f in folds:
-        print(f"  Fold {f['fold']}: train={len(f['train_idx'])} rows, "
-              f"test={len(f['test_idx'])} rows (year {f['test_year']})")
+        print(f"  Fold {folds[-1]['fold']}: "
+              f"train={len(train_idx)} rows (was {original_train}, purged {rows_purged}), "
+              f"test={len(test_idx)} rows (year {test_year}), "
+              f"train through {max_train_date.date()}, test from {min_test_date.date()}")
+
+    print(f"\nBuilt {len(folds)} walk-forward folds "
+          f"(purge={PURGE_TRADING_DAYS} trading rows/ticker)")
     return folds
 
 
@@ -109,15 +157,27 @@ def build_folds(df: pd.DataFrame) -> list[dict]:
 # 3. Models
 # ---------------------------------------------------------------------------
 
-def get_models() -> dict:
+def get_models(scale_pos_weight: float) -> dict:
+    """Build models with class-imbalance handling.
+
+    scale_pos_weight = num_negative / num_positive, computed from y_train only.
+    This ensures test labels are never used to configure the model.
+    """
     return {
-        "logistic": LogisticRegression(max_iter=1000, solver="lbfgs"),
+        "logistic": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(
+                max_iter=1000, solver="lbfgs", class_weight="balanced",
+            )),
+        ]),
         "xgboost": XGBClassifier(
             n_estimators=200, max_depth=4, learning_rate=0.05,
             eval_metric="logloss", verbosity=0, use_label_encoder=False,
+            scale_pos_weight=scale_pos_weight,
         ),
         "lightgbm": LGBMClassifier(
             n_estimators=200, max_depth=4, learning_rate=0.05, verbose=-1,
+            scale_pos_weight=scale_pos_weight,
         ),
     }
 
@@ -145,9 +205,24 @@ def train_and_evaluate(df: pd.DataFrame, folds: list[dict]) -> tuple[pd.DataFram
         X_train, y_train = X.loc[train_idx], y.loc[train_idx]
         X_test, y_test = X.loc[test_idx], y.loc[test_idx]
 
-        print(f"\n--- Fold {fold} (test year {test_year}) ---")
+        # Class imbalance stats — computed from training labels only.
+        num_positive = int(y_train.sum())
+        num_negative = int(len(y_train) - num_positive)
+        positive_rate = num_positive / len(y_train) if len(y_train) > 0 else 0.0
+        assert num_positive + num_negative == len(y_train), "class count mismatch"
 
-        for model_name, model in get_models().items():
+        if num_positive == 0:
+            print(f"\n--- Fold {fold} (test year {test_year}) --- "
+                  f"SKIPPED: no positive labels in training set")
+            continue
+
+        scale_pos_weight = num_negative / num_positive
+
+        print(f"\n--- Fold {fold} (test year {test_year}) --- "
+              f"train: {num_negative} neg / {num_positive} pos "
+              f"({positive_rate:.1%} positive, scale_pos_weight={scale_pos_weight:.2f})")
+
+        for model_name, model in get_models(scale_pos_weight).items():
             model.fit(X_train, y_train)
 
             proba = model.predict_proba(X_test)[:, 1]

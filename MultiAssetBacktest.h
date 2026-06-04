@@ -218,6 +218,7 @@ public:
 				continue;
 			}
 			auto latest_prices = build_latest_prices(date);
+			portfolio.set_latest_prices(latest_prices);
 
 			for (const auto& ticker : tickers) {
 				if (!portfolio.in_position(ticker)) {
@@ -249,19 +250,26 @@ public:
 				}
 			}
 
+			// Prediction for date D is computed from features known after D's close.
+			// Entry must happen at D+1's open. We are processing calendar date
+			// `date` (D+1), so we look up the prediction for the previous calendar
+			// date (D) and enter at today's open.
 			std::vector<EntryCandidate> candidates;
-			for (const auto& ticker : tickers) {
-				const Day* day = get_bar(ticker, date);
-				if (day == nullptr || portfolio.in_position(ticker)) {
-					continue;
-				}
+			if (calendar_index > 0) {
+				const std::string& signal_date = calendar[calendar_index - 1];
+				for (const auto& ticker : tickers) {
+					const Day* day = get_bar(ticker, date);
+					if (day == nullptr || portfolio.in_position(ticker)) {
+						continue;
+					}
 
-				auto probability = predictions.get_probability(date, ticker);
-				if (!probability.has_value() || *probability < buy_threshold) {
-					continue;
-				}
+					auto probability = predictions.get_probability(signal_date, ticker);
+					if (!probability.has_value() || *probability < buy_threshold) {
+						continue;
+					}
 
-				candidates.push_back(EntryCandidate{ ticker, *probability, day->close, date });
+					candidates.push_back(EntryCandidate{ ticker, *probability, day->open, date });
+				}
 			}
 
 			std::sort(candidates.begin(), candidates.end(),
@@ -316,6 +324,7 @@ public:
 				continue;
 			}
 			auto latest_prices = build_latest_prices(date);
+			portfolio.set_latest_prices(latest_prices);
 
 			for (const auto& ticker : tickers) {
 				if (!portfolio.in_position(ticker)) {
@@ -348,8 +357,8 @@ public:
 				}
 
 				auto bar_index = get_bar_index(ticker, date);
-				if (!exited && day != nullptr && bar_index.has_value() &&
-					strategy.generate(data.at(ticker), *bar_index, true) == Signal::SELL) {
+				if (!exited && day != nullptr && bar_index.has_value() && *bar_index > 0 &&
+					strategy.generate(data.at(ticker), *bar_index - 1, true) == Signal::SELL) {
 					portfolio.sell(ticker, day->close, date, static_cast<int>(calendar_index), "strategy_sell");
 				}
 			}
@@ -360,15 +369,17 @@ public:
 			for (const auto& ticker : tickers) {
 				const Day* day = get_bar(ticker, date);
 				auto bar_index = get_bar_index(ticker, date);
-				if (day == nullptr || !bar_index.has_value() || portfolio.in_position(ticker)) {
+				if (day == nullptr || !bar_index.has_value() || *bar_index == 0 || portfolio.in_position(ticker)) {
 					continue;
 				}
 
-				if (strategy.generate(data.at(ticker), *bar_index, false) != Signal::BUY) {
+				// Signal from previous bar, execute at current bar (matches Backtest.h timing)
+				if (strategy.generate(data.at(ticker), *bar_index - 1, false) != Signal::BUY) {
 					continue;
 				}
 
-				strategy_candidates.push_back(EntryCandidate{ ticker, 0.0, day->close, date });
+				// Enter at open (matches LabelEngine's entry_price = next-day open)
+				strategy_candidates.push_back(EntryCandidate{ ticker, 0.0, day->open, date });
 			}
 
 			std::sort(strategy_candidates.begin(), strategy_candidates.end(),

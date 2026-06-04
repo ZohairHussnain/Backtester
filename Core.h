@@ -69,10 +69,13 @@ private:
 		commission = std::min(commission, 0.01 * trade_value); //max cost 1%
 		return commission;
 	}
+	std::map<std::string, double> latest_prices_;
 	double estimated_portfolio_value() const {
 		double total = cash;
 		for (const auto& [ticker, position] : positions) {
-			total += position.shares * position.trade.entry_price;
+			auto it = latest_prices_.find(ticker);
+			double mark = (it != latest_prices_.end()) ? it->second : position.trade.entry_price;
+			total += position.shares * mark;
 		}
 		return total;
 	}
@@ -84,6 +87,9 @@ public:
 	}
 	Portfolio(double cash, double risk_per_trade, double max_position_fraction, int max_open_positions)
 		: cash(cash), risk_per_trade(risk_per_trade), max_position_fraction(max_position_fraction), max_open_positions(max_open_positions) {
+	}
+	void set_latest_prices(const std::map<std::string, double>& prices) {
+		latest_prices_ = prices;
 	}
 	bool in_position(const std::string& ticker) const {
 		return positions.find(ticker) != positions.end();

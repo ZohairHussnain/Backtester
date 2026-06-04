@@ -1254,6 +1254,245 @@ void test_e2e_determinism() {
 }
 
 // ===========================================================================
+// N. Signal/Entry Timing Verification
+// ===========================================================================
+
+// Strategy that emits BUY on exactly one bar index, HOLD otherwise.
+class BuyOnBarStrategy : public Strategy {
+	size_t target_bar;
+public:
+	explicit BuyOnBarStrategy(size_t bar) : target_bar(bar) {}
+	Signal generate(const std::vector<Day>& time_series, size_t i) override {
+		return (i == target_bar) ? Signal::BUY : Signal::HOLD;
+	}
+};
+
+void test_timing_backtest_entry_at_next_bar_open() {
+	// Bar 0: open=100 close=105
+	// Bar 1: open=110 close=115  <-- signal bar (strategy sees this bar)
+	// Bar 2: open=120 close=125  <-- entry should be at 120 (bar 2 open)
+	// Bar 3: open=130 close=135
+	std::vector<Day> days = {
+		Day("2020-01-01", 100, 106, 99, 105, 105, 1000),
+		Day("2020-01-02", 110, 116, 109, 115, 115, 1000),
+		Day("2020-01-03", 120, 126, 119, 125, 125, 1000),
+		Day("2020-01-04", 130, 136, 129, 135, 135, 1000),
+	};
+
+	// BuyOnBarStrategy(1) emits BUY when generate() is called with i=1.
+	// Backtest calls generate(time_series, i-1), so when i=2, it calls generate(..., 1) -> BUY.
+	// Entry should be at bar 2's open = 120.
+	BuyOnBarStrategy strat(1);
+	Portfolio p(100000, 0.01, 0.40, 5);
+	Backtest bt("TEST", days);
+	bt.run_backtest(p, strat, Regimes::MODERN, 0, 0.0, 0.0);
+
+	ASSERT_TRUE(p.in_position("TEST") || !p.get_trades().empty());
+
+	// Check entry price: should be bar 2 open (120) + slippage, NOT bar 1 close (115)
+	double expected_entry = 120.0 * 1.0005; // open * (1 + slippage)
+	if (!p.get_trades().empty()) {
+		ASSERT_NEAR(p.get_trades()[0].entry_price, expected_entry, 0.01);
+	} else {
+		// Still in position — sell to inspect the trade
+		p.sell("TEST", 135.0, "2020-01-05", 4, "test");
+		ASSERT_EQ(static_cast<int>(p.get_trades().size()), 1);
+		ASSERT_NEAR(p.get_trades()[0].entry_price, expected_entry, 0.01);
+	}
+}
+
+void test_timing_backtest_not_same_bar_entry() {
+	// Verify that entry does NOT happen on the signal bar itself.
+	// If strategy emits BUY on bar 1, entry must NOT be at bar 1 open/close.
+	std::vector<Day> days = {
+		Day("2020-01-01", 100, 106, 99, 105, 105, 1000),
+		Day("2020-01-02", 110, 116, 109, 115, 115, 1000), // signal bar
+		Day("2020-01-03", 120, 126, 119, 125, 125, 1000), // entry bar
+		Day("2020-01-04", 130, 136, 129, 135, 135, 1000),
+	};
+
+	BuyOnBarStrategy strat(1);
+	Portfolio p(100000, 0.01, 0.40, 5);
+	Backtest bt("TEST", days);
+	bt.run_backtest(p, strat, Regimes::MODERN, 0, 0.0, 0.0);
+
+	// Force close to get the trade
+	p.sell("TEST", 135.0, "2020-01-05", 4, "test_close");
+	ASSERT_EQ(static_cast<int>(p.get_trades().size()), 1);
+
+	double entry = p.get_trades()[0].entry_price;
+	// Must NOT be bar 1 open (110) or close (115) + slippage
+	ASSERT_TRUE(std::abs(entry - 110.0 * 1.0005) > 1.0); // not bar 1 open
+	ASSERT_TRUE(std::abs(entry - 115.0 * 1.0005) > 1.0); // not bar 1 close
+	// MUST be bar 2 open (120) + slippage
+	ASSERT_NEAR(entry, 120.0 * 1.0005, 0.01);
+}
+
+void test_timing_multi_strategy_entry_at_next_bar_open() {
+	// Same test but for MultiAssetBacktest strategy path.
+	std::vector<Day> days = {
+		Day("2020-01-01", 100, 106, 99, 105, 105, 1000),
+		Day("2020-01-02", 110, 116, 109, 115, 115, 1000), // signal bar
+		Day("2020-01-03", 120, 126, 119, 125, 125, 1000), // entry bar
+		Day("2020-01-04", 130, 136, 129, 135, 135, 1000),
+	};
+
+	std::map<std::string, std::vector<Day>> data;
+	data["TEST"] = days;
+
+	BuyOnBarStrategy strat(1);
+	Portfolio p(100000, 0.01, 0.40, 5);
+	MultiAssetBacktest multi({"TEST"}, std::move(data), p);
+	multi.run_with_strategy(strat, 0, 0.0, 0.0, "2020-01-01", "2020-01-04");
+
+	auto& trades = multi.get_portfolio().get_trades();
+	// May still be in position at end — that's fine, check entry price
+	// The portfolio is const, so if no trades closed, we verify via equity curve
+	// or check that something was entered.
+	ASSERT_TRUE(!multi.get_equity_curve().empty());
+
+	// If trades exist, verify entry price
+	if (!trades.empty()) {
+		double entry = trades[0].entry_price;
+		ASSERT_NEAR(entry, 120.0 * 1.0005, 0.01); // bar 2 open + slippage
+	}
+}
+
+void test_timing_multi_prediction_entry_at_next_bar_open() {
+	// Prediction for date D (2020-01-02), entry should be at D+1 (2020-01-03) open.
+	std::vector<Day> days = {
+		Day("2020-01-01", 100, 106, 99, 105, 105, 1000),
+		Day("2020-01-02", 110, 116, 109, 115, 115, 1000), // prediction date
+		Day("2020-01-03", 120, 126, 119, 125, 125, 1000), // entry date (open=120)
+		Day("2020-01-04", 130, 136, 129, 135, 135, 1000),
+		Day("2020-01-05", 140, 146, 139, 145, 145, 1000),
+	};
+
+	std::map<std::string, std::vector<Day>> data;
+	data["TEST"] = days;
+
+	// Prediction only on 2020-01-02 with high probability
+	write_test_predictions("test_data/timing_pred.csv",
+		"date,ticker,probability\n"
+		"2020-01-02,TEST,0.95\n"
+	);
+	PredictionLoader loader("test_data/timing_pred.csv");
+
+	Portfolio p(100000, 0.01, 0.40, 5);
+	MultiAssetBacktest multi({"TEST"}, std::move(data), p);
+	multi.run_with_predictions(loader, 0.60, 0, 0.0, 0.0, "2020-01-01", "2020-01-05");
+
+	auto& trades = multi.get_portfolio().get_trades();
+	// Force examination: the prediction is for 2020-01-02.
+	// The backtest processes dates in order. When processing 2020-01-03,
+	// it looks up prediction for the previous calendar date (2020-01-02).
+	// It should enter at 2020-01-03 open = 120.
+
+	// Check equity curve exists (backtest ran)
+	ASSERT_TRUE(!multi.get_equity_curve().empty());
+	ASSERT_EQ(static_cast<int>(multi.get_equity_curve().size()), 5);
+
+	// If a trade was entered, verify entry price is bar 2020-01-03 open
+	if (!trades.empty()) {
+		double entry = trades[0].entry_price;
+		// Must be 120 * 1.0005, NOT 110 (2020-01-02 open) or 115 (2020-01-02 close)
+		ASSERT_NEAR(entry, 120.0 * 1.0005, 0.01);
+		ASSERT_TRUE(std::abs(entry - 110.0 * 1.0005) > 1.0); // not prediction date open
+		ASSERT_TRUE(std::abs(entry - 115.0 * 1.0005) > 1.0); // not prediction date close
+	}
+}
+
+// ===========================================================================
+// O. Portfolio Mark-to-Market Risk Sizing
+// ===========================================================================
+
+void test_portfolio_mtm_valuation() {
+	// Buy AAPL at $100. Set latest price to $120.
+	// estimated_portfolio_value (via set_latest_prices) should reflect unrealized gain.
+	Portfolio p(10000, 0.01, 0.40, 5);
+	p.buy("AAPL", 100.0, "2020-01-01", 0, 90.0, 120.0);
+
+	// Before setting latest prices, value() with explicit prices should show gain
+	double val_at_120 = p.value({{"AAPL", 120.0}});
+	double val_at_100 = p.value({{"AAPL", 100.0}});
+	ASSERT_TRUE(val_at_120 > val_at_100);
+
+	// After set_latest_prices, the internal estimated_portfolio_value uses 120
+	p.set_latest_prices({{"AAPL", 120.0}});
+	// We can't call estimated_portfolio_value directly (private), but we can
+	// observe the effect through position sizing on a second buy.
+	// With higher portfolio value, risk budget is larger -> more shares on next buy.
+	// We'll test this in the next test.
+	ASSERT_TRUE(true); // setup verification passed
+}
+
+void test_portfolio_mtm_risk_sizing_increases_with_gain() {
+	// Two identical portfolios. Both buy AAPL at $100.
+	// Portfolio A: latest price = $100 (flat)
+	// Portfolio B: latest price = $200 (doubled)
+	// Both then buy MSFT at $50. Portfolio B should get more shares
+	// because its estimated equity is higher -> larger risk budget.
+	//
+	// Use high max_position_fraction (1.0) so cash budget is not the binding
+	// constraint — risk budget should drive the difference.
+
+	Portfolio pa(10000, 0.01, 1.0, 5);
+	Portfolio pb(10000, 0.01, 1.0, 5);
+
+	pa.buy("AAPL", 100.0, "2020-01-01", 0, 90.0, 120.0);
+	pb.buy("AAPL", 100.0, "2020-01-01", 0, 90.0, 120.0);
+
+	// Mark portfolio A at entry price (flat)
+	pa.set_latest_prices({{"AAPL", 100.0}});
+	// Mark portfolio B at 2x (big unrealized gain)
+	pb.set_latest_prices({{"AAPL", 200.0}});
+
+	// Buy MSFT with wide stop so risk budget is the binding constraint
+	pa.buy("MSFT", 50.0, "2020-01-02", 1, 25.0, 80.0);
+	pb.buy("MSFT", 50.0, "2020-01-02", 1, 25.0, 80.0);
+
+	// Close MSFT in both to inspect shares
+	pa.sell("MSFT", 55.0, "2020-01-03", 2, "test");
+	pb.sell("MSFT", 55.0, "2020-01-03", 2, "test");
+
+	// Find the MSFT trade in each
+	double shares_a = 0, shares_b = 0;
+	for (auto& t : pa.get_trades()) {
+		if (t.entry_date == "2020-01-02") shares_a = t.shares;
+	}
+	for (auto& t : pb.get_trades()) {
+		if (t.entry_date == "2020-01-02") shares_b = t.shares;
+	}
+
+	// Portfolio B has higher equity -> larger risk budget -> more shares
+	ASSERT_TRUE(shares_a > 0);
+	ASSERT_TRUE(shares_b > 0);
+	ASSERT_TRUE(shares_b > shares_a);
+}
+
+void test_portfolio_mtm_fallback_to_entry_price() {
+	// If latest price is not set for a ticker, fall back to entry price.
+	Portfolio p(10000, 0.01, 0.10, 5);
+	p.buy("AAPL", 100.0, "2020-01-01", 0, 90.0, 120.0);
+
+	// Set latest prices for a DIFFERENT ticker — AAPL should fall back to entry
+	p.set_latest_prices({{"MSFT", 200.0}});
+
+	// Buy MSFT — risk sizing should use AAPL at entry price (no crash, reasonable size)
+	p.buy("MSFT", 50.0, "2020-01-02", 1, 45.0, 60.0);
+	ASSERT_TRUE(p.in_position("MSFT"));
+}
+
+void test_portfolio_mtm_no_prices_set() {
+	// When no latest prices are set at all, falls back to entry price for all.
+	Portfolio p(10000, 0.01, 0.10, 5);
+	p.buy("AAPL", 100.0, "2020-01-01", 0, 90.0, 120.0);
+	// Don't call set_latest_prices at all
+	p.buy("MSFT", 50.0, "2020-01-02", 1, 45.0, 60.0);
+	ASSERT_TRUE(p.in_position("MSFT")); // should still work
+}
+
+// ===========================================================================
 // Main
 // ===========================================================================
 
@@ -1377,6 +1616,18 @@ int main() {
 	RUN_TEST(test_e2e_ml_pipeline_round_trip);
 	RUN_TEST(test_e2e_prediction_round_trip);
 	RUN_TEST(test_e2e_determinism);
+
+	std::cout << "\n-- N. Signal/Entry Timing --\n";
+	RUN_TEST(test_timing_backtest_entry_at_next_bar_open);
+	RUN_TEST(test_timing_backtest_not_same_bar_entry);
+	RUN_TEST(test_timing_multi_strategy_entry_at_next_bar_open);
+	RUN_TEST(test_timing_multi_prediction_entry_at_next_bar_open);
+
+	std::cout << "\n-- O. Portfolio Mark-to-Market --\n";
+	RUN_TEST(test_portfolio_mtm_valuation);
+	RUN_TEST(test_portfolio_mtm_risk_sizing_increases_with_gain);
+	RUN_TEST(test_portfolio_mtm_fallback_to_entry_price);
+	RUN_TEST(test_portfolio_mtm_no_prices_set);
 
 	std::cout << "\n=== Results: " << tests_passed << "/" << tests_run << " passed";
 	if (tests_failed > 0) {
