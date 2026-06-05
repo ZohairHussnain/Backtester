@@ -45,8 +45,10 @@ class OrderGenerator:
 
         # --- Entry orders ---
         open_positions = portfolio_state.get("open_positions", {})
-        n_open = len(open_positions) - len(exit_tickers or [])
-        slots_available = self.max_positions - max(n_open, 0)
+        # Count positions that will remain after exits
+        valid_exits = [t for t in (exit_tickers or []) if t in open_positions]
+        n_remaining = len(open_positions) - len(valid_exits)
+        slots_available = self.max_positions - max(n_remaining, 0)
 
         if slots_available <= 0:
             if orders:
@@ -104,6 +106,7 @@ class OrderGenerator:
 
             shares = self._size_position(entry_price, equity, cash)
             if shares <= 0:
+                print(f"    SKIP {ticker}: position sized to zero (equity=${equity:.2f}, cash=${cash:.2f})")
                 continue
 
             # Portfolio risk check

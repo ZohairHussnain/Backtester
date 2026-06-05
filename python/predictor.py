@@ -1,11 +1,11 @@
 """Model loading and inference for production predictions."""
 
-import json
 import re
 from datetime import datetime
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 
 from config import FEATURE_COLS, EXPORT_MODEL, MODELS_DIR
@@ -19,7 +19,10 @@ class Predictor:
         self.fold = None
 
     def load_latest_model(self) -> None:
-        """Load the most recent fold's model. The last fold has the most training data."""
+        """Load the most recent fold's model. Raises on failure."""
+        if not self.models_dir.exists():
+            raise FileNotFoundError(f"Models directory not found: {self.models_dir}")
+
         pattern = re.compile(rf"^{EXPORT_MODEL}_fold(\d+)\.joblib$")
         candidates = []
         for f in self.models_dir.iterdir():
@@ -31,8 +34,13 @@ class Predictor:
             raise FileNotFoundError(f"No {EXPORT_MODEL} models found in {self.models_dir}")
 
         candidates.sort(key=lambda x: x[0])
-        self.fold, self.model_path = candidates[-1]  # highest fold = most recent
-        self.model = joblib.load(self.model_path)
+        self.fold, self.model_path = candidates[-1]
+
+        try:
+            self.model = joblib.load(self.model_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model {self.model_path}: {e}") from e
+
         print(f"Loaded model: {self.model_path.name} (fold {self.fold})")
 
     def validate_feature_schema(self, feature_df: pd.DataFrame) -> None:
@@ -40,31 +48,34 @@ class Predictor:
         missing = [c for c in FEATURE_COLS if c not in feature_df.columns]
         if missing:
             raise ValueError(f"Missing feature columns: {missing}")
-        extra = [c for c in feature_df.columns
-                 if c not in FEATURE_COLS and c not in ("date", "ticker")]
-        if extra:
-            print(f"  Warning: extra columns ignored: {extra}")
 
     def predict(self, feature_df: pd.DataFrame) -> pd.DataFrame:
         """Generate probabilities for all rows in feature_df.
 
-        Returns DataFrame with columns: date, ticker, probability
+        Returns DataFrame with columns: date, ticker, probability.
+        Drops rows with NaN features (logs which tickers were dropped).
         """
         if self.model is None:
             raise RuntimeError("No model loaded. Call load_latest_model() first.")
 
         self.validate_feature_schema(feature_df)
-
         X = feature_df[FEATURE_COLS]
 
-        if X.isnull().any().any():
-            n_bad = X.isnull().any(axis=1).sum()
-            print(f"  Warning: {n_bad} rows with NaN features — dropping")
-            mask = ~X.isnull().any(axis=1)
-            X = X[mask]
-            feature_df = feature_df[mask]
+        # Check for NaN/inf
+        bad_mask = X.isnull().any(axis=1) | np.isinf(X).any(axis=1)
+        if bad_mask.any():
+            dropped = feature_df.loc[bad_mask, "ticker"].tolist()
+            print(f"  WARNING: Dropping {len(dropped)} rows with bad features: {dropped}")
+            X = X[~bad_mask]
+            feature_df = feature_df[~bad_mask]
 
-        proba = self.model.predict_proba(X)[:, 1]
+        if X.empty:
+            return pd.DataFrame(columns=["date", "ticker", "probability"])
+
+        try:
+            proba = self.model.predict_proba(X)[:, 1]
+        except Exception as e:
+            raise RuntimeError(f"predict_proba failed: {e}") from e
 
         result = feature_df[["date", "ticker"]].copy()
         result["probability"] = proba
@@ -73,7 +84,7 @@ class Predictor:
     def get_metadata(self) -> dict:
         return {
             "model_type": EXPORT_MODEL,
-            "model_path": str(self.model_path),
+            "model_path": str(self.model_path) if self.model_path else None,
             "fold": self.fold,
             "feature_count": len(FEATURE_COLS),
             "feature_cols": FEATURE_COLS,

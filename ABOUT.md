@@ -1,43 +1,64 @@
 # What BackTester Is
 
-BackTester is a local, offline stock strategy backtesting engine written in C++20. You give it historical daily OHLCV price data as JSON files, pick a strategy and a date range, and it simulates trading that strategy day by day -- tracking a portfolio with cash, positions, fees, and slippage -- then reports how it would have performed.
+BackTester is a quantitative trading research and execution system. It started as a C++20 daily-bar backtesting engine, and has grown into a full ML-driven trading pipeline with walk-forward validation, a Python production pipeline, and IBKR paper trading integration.
 
 ## What it does
 
-- **Simulates trading strategies on historical data.** It walks through daily bars in order, generates buy/sell signals from a strategy, executes them against a portfolio, and records the equity value after each day. At the end you get an equity curve, a list of closed trades, and performance metrics.
+### C++ Backtesting Engine
 
-- **Models realistic execution costs.** Every buy fills at a slippage-adjusted price above the close. Every sell fills below. Commissions are per-share with a minimum and a cap. Position sizing accounts for these costs iteratively -- it won't let fees push you past your risk budget.
+- **Simulates trading strategies on historical data.** Walks through daily bars, generates buy/sell signals, executes against a portfolio with cash, positions, fees, and slippage, and records equity curves and trade logs.
 
-- **Manages risk at the portfolio level.** Each trade risks a configurable percentage of portfolio value. Position size is the smaller of what the risk budget allows and what the cash allocation cap allows. The portfolio can hold multiple concurrent positions across different tickers, with a configurable cap on how many.
+- **Models realistic execution costs.** Entry at next-day open with slippage. Commissions per-share with min/max bounds. Position sizing accounts for costs iteratively.
 
-- **Supports swing trade mechanics.** Trades can have stop-loss prices, take-profit targets, and a maximum holding period. On each bar the engine checks stops and targets against the day's low and high before evaluating strategy signals. If a trade exceeds the max hold period it exits at the close.
+- **Manages risk at the portfolio level.** Risk-per-trade and max-position-fraction constraints. Mark-to-market equity for sizing. Supports multiple concurrent positions with a configurable cap.
 
-- **Runs single-ticker and multi-ticker backtests.** The single-ticker engine (`Backtest`) is simpler and iterates one time series. The multi-ticker engine (`MultiAssetBacktest`) builds a shared calendar across all tickers, processes all exits before entries on each date, and records one portfolio value per date. This means you can test strategies that allocate across multiple stocks from a single cash pool.
+- **Supports swing trade mechanics.** Stop-loss, take-profit targets, and maximum holding period. Exits checked before entries each bar.
 
-- **Supports ML-driven entries.** The multi-ticker engine can rank entry candidates by probability scores loaded from an external CSV (produced by a model trained elsewhere). On each date it enters the highest-probability candidates first, up to the position limit.
+- **Runs single-ticker and multi-ticker backtests.** `Backtest` for single-ticker. `MultiAssetBacktest` for multi-ticker with a shared calendar, exit-before-entry ordering, and one equity point per date.
 
-- **Exports training data for ML models.** The feature engine computes technical indicators (momentum returns, RSI, ATR, volume ratio, moving average distances, rolling volatility) from historical bars. The label engine looks forward from each date and asks: did price hit the profit target before the stop loss within N days? The exporter joins features and labels by date and writes a CSV that can be fed to a classifier.
+- **Exports ML training data.** FeatureEngine computes 11 technical features from past/current bars only. LabelEngine generates two label types (target-stop and median-return) using future data as targets only. MLDataExporter joins features and labels by date+ticker.
 
-- **Computes standard performance metrics.** Maximum drawdown, CAGR, annualized Sharpe ratio (with a 4% risk-free rate), plus trade-level stats: total trades, win rate, expectancy, average win/loss, profit factor, total fees.
+### Python ML Pipeline
 
-- **Plots the equity curve.** If gnuplot is on your PATH, it opens a chart window automatically.
+- **Walk-forward training.** Expanding-window yearly folds with per-ticker row-based purge/embargo. No label overlap across fold boundaries. Class-balanced training. Pre-committed model export (no test-set snooping).
+
+- **Three models trained per fold.** Logistic Regression (with StandardScaler), XGBoost, LightGBM. Logistic Regression selected as the production model based on research (highest AUC, best calibration).
+
+- **101-stock universe.** Technology, healthcare, financials, consumer, industrials, energy, utilities, communications. Downloaded via yfinance.
+
+- **Research validated.** Cross-sectional leave-one-out AUC ~0.665 across all 7 sectors. Model generalizes — it learns a reusable swing-trading pattern, not stock-specific behavior. Adversarial validation confirmed signal alpha over random selection.
+
+### Production Pipeline
+
+- **Single daily command.** `python run_daily.py` downloads data, computes features, generates predictions, ranks candidates, sizes positions, and produces orders.
+
+- **Three execution modes.** `sim` (simulated fills), `ibkr_dry_run` (connect IBKR, log intended orders, submit nothing), `ibkr_paper` (submit MOO orders to IBKR paper account).
+
+- **IBKR paper trading integration.** Paper-only port (4002) hardcoded. Account prefix verification. Pre-flight checks compare local vs broker state. Duplicate order protection. MOO (market-on-open) orders only.
+
+- **Order lifecycle management.** SIGNAL -> PENDING -> SUBMITTED -> FILLED/CANCELLED/REJECTED. Portfolio state updated only from confirmed fills via FillReconciler. Atomic JSON saves with backup.
 
 ## What it is not
 
-- **Not a live trading system.** There is no broker connection, no order management, no real-time data feed, no execution engine. It reads static JSON files from disk and simulates trades in a loop. It cannot place or manage real orders.
+- **Not a live trading system yet.** IBKR integration is paper-only. Live port (4001) is blocked at import time. Switching to live requires a code change visible in git.
 
-- **Not a data provider.** It does not download, scrape, or stream market data. You must supply your own JSON files in `ticker_data/`. The `cpr` HTTP library is listed as a dependency but is not used for data fetching in the current implementation.
+- **Not a data provider.** Downloads historical data via yfinance. Does not stream real-time data.
 
-- **Not a machine learning framework.** It exports features and labels to CSV and can import prediction probabilities from CSV, but it does not train, evaluate, or serve models. The ML workflow assumes you train externally (Python, R, etc.) and bring predictions back as a CSV file.
+- **Not a high-frequency system.** Operates on daily bars. Signals generated after close, orders submitted before open. No intraday logic.
 
-- **Not configurable at runtime.** There are no command-line arguments, no config files, no GUI. To change the ticker, strategy, date range, risk parameters, or anything else, you edit `main()` in `Source.cpp` and recompile.
+- **Not a portfolio optimizer.** Runs a single pre-committed configuration. Does not search parameter space or do walk-forward optimization.
 
-- **Not a portfolio optimizer.** It does not search for optimal parameters, run walk-forward analysis, or do combinatorial strategy selection. It runs one configuration and reports the result. If you want to compare strategies or sweep parameters, you write the loop yourself.
+- **Not multi-asset-class.** US equities only. No futures, options, forex, or crypto.
 
-- **Not an event-driven or tick-level simulator.** It operates on daily bars only. Intraday price action within a bar is not modeled -- when both stop and target are breached on the same day, it uses a heuristic (distance from open) to decide which hit first. It does not simulate order books, partial fills, or market microstructure.
+## Current performance (research, not live)
 
-- **Not multi-asset-class.** It assumes equity-like instruments with OHLCV bars and prices in a single currency. There is no support for futures, options, forex margin, crypto, or instruments that require different position/margin models.
+- Model: Logistic Regression on label_median_return
+- Universe: 101 US stocks across 8 sectors
+- AUC: ~0.60 (pooled walk-forward, out-of-sample)
+- Cross-sectional: leave-one-out AUC ~0.665 across all tickers
+- Top-pick excess return: +1.16% over universe average per 20-day trade
+- Signal alpha over random selection: +7-8% CAGR, +1.4 Sharpe
 
-- **Not a risk analytics platform.** It computes a small fixed set of metrics. There is no Value-at-Risk, no Monte Carlo simulation, no correlation analysis, no benchmark comparison, no rolling-window statistics.
+## Test coverage
 
-- **Tested with a lightweight suite.** The project includes 186 assertions across 13 test sections covering unit tests (Trade, Portfolio, strategies, metrics, fees), component tests (FeatureEngine, LabelEngine, PredictionLoader, MLDataExporter), integration tests (Backtest, MultiAssetBacktest), and end-to-end smoke tests (synthetic single/multi-ticker runs, ML pipeline round-trip, determinism). Tests use synthetic in-memory data and a zero-dependency assert harness -- no external test framework is required.
+203 assertions across 15 test sections: Trade, Portfolio, Transaction Costs, Strategies, Metrics, TradeMetrics, FeatureEngine, LabelEngine, PredictionLoader, MLDataExporter, Backtest Integration, MultiAssetBacktest, End-to-End Smoke, Signal/Entry Timing, Portfolio Mark-to-Market.

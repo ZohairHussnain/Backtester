@@ -5,3 +5,5 @@ xgboost
 lightgbm
 matplotlib
 joblib
+yfinance
+ib_insync

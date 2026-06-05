@@ -7,7 +7,8 @@
       "Bash(./build/Debug/BackTesterTests.exe:*)",
       "Bash(ctest:*)",
       "Bash(python walk_forward_train.py)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(pip install:*)"
     ]
   }
 }
