@@ -684,7 +684,7 @@ void test_label_target_hit() {
 	bool found = false;
 	for (const auto& l : labels) {
 		if (l.date == days[199].date) {
-			ASSERT_EQ(l.label, 1);
+			ASSERT_EQ(l.label_target_stop, 1);
 			found = true;
 			break;
 		}
@@ -701,7 +701,7 @@ void test_label_stop_hit() {
 	bool found = false;
 	for (const auto& l : labels) {
 		if (l.date == days[199].date) {
-			ASSERT_EQ(l.label, 0);
+			ASSERT_EQ(l.label_target_stop, 0);
 			found = true;
 			break;
 		}
@@ -720,7 +720,7 @@ void test_label_same_day_stop_closer() {
 	bool found = false;
 	for (const auto& l : labels) {
 		if (l.date == days[199].date) {
-			ASSERT_EQ(l.label, 0);
+			ASSERT_EQ(l.label_target_stop, 0);
 			found = true;
 			break;
 		}
@@ -738,7 +738,7 @@ void test_label_same_day_target_closer() {
 	bool found = false;
 	for (const auto& l : labels) {
 		if (l.date == days[199].date) {
-			ASSERT_EQ(l.label, 1);
+			ASSERT_EQ(l.label_target_stop, 1);
 			found = true;
 			break;
 		}
@@ -759,7 +759,7 @@ void test_label_timeout_profitable() {
 	bool found = false;
 	for (const auto& l : labels) {
 		if (l.date == days[199].date) {
-			ASSERT_EQ(l.label, 1);
+			ASSERT_EQ(l.label_target_stop, 1);
 			found = true;
 			break;
 		}
@@ -778,7 +778,7 @@ void test_label_timeout_unprofitable() {
 	bool found = false;
 	for (const auto& l : labels) {
 		if (l.date == days[199].date) {
-			ASSERT_EQ(l.label, 0);
+			ASSERT_EQ(l.label_target_stop, 0);
 			found = true;
 			break;
 		}
@@ -841,8 +841,8 @@ void test_mlexporter_matching_keys() {
 		{"2020-01-03", "AAPL", 0.01, 0.02, 0.03, 0.04, 50, 0.01, 1.0, 0.0, 0.0, 0.0, 0.01},
 	};
 	std::vector<LabelRow> labels = {
-		{"2020-01-01", "AAPL", 1, 100, 110, 95},
-		{"2020-01-02", "AAPL", 0, 100, 110, 95},
+		{"2020-01-01", "AAPL", 1, 1, 0.05},
+		{"2020-01-02", "AAPL", 0, 0, -0.02},
 	};
 	size_t rows = MLDataExporter::save_csv(features, labels, "test_data/ml_out1.csv");
 	ASSERT_EQ(static_cast<int>(rows), 2);
@@ -853,7 +853,7 @@ void test_mlexporter_no_matches() {
 		{"2020-01-01", "AAPL", 0.01, 0.02, 0.03, 0.04, 50, 0.01, 1.0, 0.0, 0.0, 0.0, 0.01},
 	};
 	std::vector<LabelRow> labels = {
-		{"2020-01-02", "MSFT", 1, 100, 110, 95},
+		{"2020-01-02", "MSFT", 1, 1, 0.05},
 	};
 	size_t rows = MLDataExporter::save_csv(features, labels, "test_data/ml_out2.csv");
 	ASSERT_EQ(static_cast<int>(rows), 0);

@@ -1,1 +1,1 @@
-date,ticker,ret_1d,ret_5d,ret_10d,ret_20d,rsi_14,atr_14_pct,volume_ratio_20,dist_ma20,dist_ma50,dist_ma200,rolling_vol_20,label
+date,ticker,ret_1d,ret_5d,ret_10d,ret_20d,rsi_14,atr_14_pct,volume_ratio_20,dist_ma20,dist_ma50,dist_ma200,rolling_vol_20,label_target_stop,label_median_return,forward_return
