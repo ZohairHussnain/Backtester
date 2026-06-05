@@ -67,15 +67,35 @@ int main() {
 	std::cout << "Closed trades: " << multi.get_portfolio().get_trades().size() << "\n";
 	TradeMetrics::save_csv(multi.get_portfolio().get_trades(), "output/trades.csv");
 
-	// ML dataset export:
-	// Features use only past/current data; labels use future OHLC for the same dates.
-	// The exporter joins rows by date + ticker and writes only rows with both sides.
-	// Exports both label_target_stop and label_median_return for each row.
+	// ML dataset export for all tickers in ticker_data/universe.txt.
+	// Exports both label_target_stop and label_median_return per row.
 	{
-		Backtest b_export(ticker, 1);
-		auto features = FeatureEngine::generate(ticker, b_export.get_time_series());
-		auto labels = LabelEngine::generate(ticker, b_export.get_time_series(), target_profit_pct, stop_loss_pct, max_hold_days);
-		size_t ml_rows = MLDataExporter::save_csv(features, labels);
+		std::vector<std::string> ml_tickers;
+		std::ifstream uni_file("ticker_data/universe.txt");
+		if (uni_file.is_open()) {
+			std::string line;
+			while (std::getline(uni_file, line)) {
+				if (!line.empty()) ml_tickers.push_back(line);
+			}
+		} else {
+			ml_tickers = {"AAPL", "MSFT", "NVDA", "SPY"};
+		}
+		std::cout << "Exporting ML data for " << ml_tickers.size() << " tickers...\n";
+		std::vector<FeatureRow> all_features;
+		std::vector<LabelRow> all_labels;
+		for (const auto& t : ml_tickers) {
+			try {
+				Backtest b_export(t, 1);
+				auto features = FeatureEngine::generate(t, b_export.get_time_series());
+				auto labels = LabelEngine::generate(t, b_export.get_time_series(), target_profit_pct, stop_loss_pct, max_hold_days);
+				std::cout << "  " << t << ": " << features.size() << " features, " << labels.size() << " labels\n";
+				all_features.insert(all_features.end(), features.begin(), features.end());
+				all_labels.insert(all_labels.end(), labels.begin(), labels.end());
+			} catch (const std::exception& e) {
+				std::cout << "  " << t << ": SKIPPED (" << e.what() << ")\n";
+			}
+		}
+		size_t ml_rows = MLDataExporter::save_csv(all_features, all_labels);
 		std::cout << "ML rows exported: " << ml_rows << " to output/ml_dataset.csv\n";
 	}
 

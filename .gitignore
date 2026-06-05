@@ -10,11 +10,13 @@ build/
 x64/
 out/
 
-# Generated ML artifacts
+# Generated ML artifacts and output
 python/models/
-output/predictions.csv
-output/predictions_all.csv
-output/ml_metrics.csv
+output/
+
+# Downloaded ticker data (re-downloadable via python/download_data.py)
+ticker_data/*.json
+ticker_data/universe.txt
 
 # Test data
 test_data/

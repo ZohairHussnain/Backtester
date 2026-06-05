@@ -6,7 +6,8 @@
       "Bash(cmake:*)",
       "Bash(./build/Debug/BackTesterTests.exe:*)",
       "Bash(ctest:*)",
-      "Bash(python walk_forward_train.py)"
+      "Bash(python walk_forward_train.py)",
+      "Bash(python:*)"
     ]
   }
 }
