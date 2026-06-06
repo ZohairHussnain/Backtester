@@ -18,6 +18,7 @@ Safety (ibkr_paper):
 
 import argparse
 import csv
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
     UNIVERSE_FILE, MODELS_DIR, PORTFOLIO_STATE_FILE,
+    PORTFOLIO_STATE_FILE_SIM, PORTFOLIO_STATE_FILE_PAPER,
+    state_file_for_mode,
     ORDERS_FILE, OUTPUT_DIR, STARTING_CAPITAL, THRESHOLD,
     SLIPPAGE, FEE_PER_SHARE, FEE_MIN, FEE_CAP_PCT,
 )
@@ -318,7 +321,7 @@ def generate_signals_and_orders(portfolio: Portfolio, today: str):
 # ======================================================================
 
 def run_sim(today: str):
-    portfolio = Portfolio(PORTFOLIO_STATE_FILE, STARTING_CAPITAL)
+    portfolio = Portfolio(state_file_for_mode("sim"), STARTING_CAPITAL)
     is_duplicate = check_duplicate(portfolio, today)
     orders, predictions, _ = generate_signals_and_orders(portfolio, today)
 
@@ -368,7 +371,7 @@ def _apply_sim_orders(orders, portfolio: Portfolio, today: str) -> None:
 # ======================================================================
 
 def run_ibkr_dry_run(today: str):
-    portfolio = Portfolio(PORTFOLIO_STATE_FILE, STARTING_CAPITAL)
+    portfolio = Portfolio(state_file_for_mode("ibkr_dry_run"), STARTING_CAPITAL)
     orders, predictions, _ = generate_signals_and_orders(portfolio, today)
 
     print("\n[6/7] IBKR DRY RUN -- NO ORDERS SUBMITTED...")
@@ -400,7 +403,7 @@ def run_ibkr_dry_run(today: str):
 # ======================================================================
 
 def run_ibkr_paper(today: str):
-    portfolio = Portfolio(PORTFOLIO_STATE_FILE, STARTING_CAPITAL)
+    portfolio = Portfolio(state_file_for_mode("ibkr_paper"), STARTING_CAPITAL)
     is_duplicate = check_duplicate(portfolio, today)
 
     if is_duplicate:
@@ -506,7 +509,8 @@ def run_ibkr_paper(today: str):
 def run_reconcile_only(today: str):
     print("\n  Reconcile-only mode: fetching fills from IBKR...")
 
-    portfolio = Portfolio(PORTFOLIO_STATE_FILE, STARTING_CAPITAL)
+    # Reconciliation applies IBKR fills, so it operates on PAPER state.
+    portfolio = Portfolio(PORTFOLIO_STATE_FILE_PAPER, STARTING_CAPITAL)
     broker = create_broker("ibkr_dry_run")
 
     if not hasattr(broker, '_connected') or not broker._connected:
@@ -569,6 +573,35 @@ def check_duplicate(portfolio: Portfolio, today: str) -> bool:
     return False
 
 
+def migrate_legacy_sim_state(legacy: Path = PORTFOLIO_STATE_FILE,
+                             sim: Path = PORTFOLIO_STATE_FILE_SIM) -> bool:
+    """One-time migration of pre-Phase-1 state.
+
+    If a legacy portfolio_state.json exists and no sim state file does yet,
+    copy it to the sim file. Those positions were created by sim fills, so they
+    belong to sim -- NOT to paper. Paper state is intentionally left untouched
+    so it starts clean. Returns True if a migration was performed.
+    """
+    if legacy.exists() and not sim.exists():
+        sim.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(legacy, sim)
+        print(f"  Migrated legacy state '{legacy.name}' -> '{sim.name}' (sim only; paper untouched).")
+        return True
+    return False
+
+
+def reset_sim_state(sim: Path = PORTFOLIO_STATE_FILE_SIM) -> list:
+    """Delete the sim state file and its sidecars so the next sim run starts
+    fresh. Does NOT touch paper state. Returns the list of removed paths.
+    """
+    removed = []
+    for p in (sim, Path(str(sim) + ".bak"), Path(str(sim) + ".tmp")):
+        if p.exists():
+            p.unlink()
+            removed.append(p)
+    return removed
+
+
 def _has_pending_order(ticker: str, today: str) -> bool:
     """Check orders_lifecycle.csv for existing SUBMITTED/PENDING order for same ticker+date."""
     lifecycle_path = OUTPUT_DIR / "orders_lifecycle.csv"
@@ -623,11 +656,26 @@ def parse_args():
                        help="Allow ibkr_paper outside MOO window (requires --i-understand-time-risk)")
     parser.add_argument("--i-understand-time-risk", action="store_true",
                        help="Second confirmation for time override")
+    parser.add_argument("--reset-sim-state", action="store_true",
+                       help="Delete the sim portfolio state (and sidecars) and exit. Paper state untouched.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # --- Reset sim state and exit (does not touch paper state) ---
+    if args.reset_sim_state:
+        removed = reset_sim_state()
+        if removed:
+            print(f"Reset sim state. Removed: {[p.name for p in removed]}")
+        else:
+            print("Reset sim state. Nothing to remove (already clean).")
+        return
+
+    # --- One-time migration of legacy state into the sim file ---
+    migrate_legacy_sim_state()
+
     today = datetime.now().strftime("%Y-%m-%d")
     now_et = get_et_now()
 

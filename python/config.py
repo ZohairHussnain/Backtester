@@ -13,7 +13,36 @@ OUTPUT_DIR = PROJECT_DIR / "output"
 MODELS_DIR = SCRIPT_DIR / "models"
 
 UNIVERSE_FILE = TICKER_DATA_DIR / "universe.txt"
+
+# Portfolio state files.
+#   PORTFOLIO_STATE_FILE        — legacy path (pre Phase 1). Kept for migration
+#                                 and as the default for the Portfolio class.
+#   PORTFOLIO_STATE_FILE_SIM    — sim mode only. Fully isolated test state.
+#   PORTFOLIO_STATE_FILE_PAPER  — IBKR dry-run / paper. The source of truth that
+#                                 must never be contaminated by sim testing.
 PORTFOLIO_STATE_FILE = OUTPUT_DIR / "portfolio_state.json"
+PORTFOLIO_STATE_FILE_SIM = OUTPUT_DIR / "portfolio_state.sim.json"
+PORTFOLIO_STATE_FILE_PAPER = OUTPUT_DIR / "portfolio_state.paper.json"
+
+# Which state file each run mode reads/writes. Separating sim from paper means
+# a sim run can no longer add positions to — or advance the duplicate-run
+# timestamp of — the state that IBKR paper mode trusts.
+STATE_FILE_BY_MODE = {
+    "sim": PORTFOLIO_STATE_FILE_SIM,
+    "ibkr_dry_run": PORTFOLIO_STATE_FILE_PAPER,
+    "ibkr_paper": PORTFOLIO_STATE_FILE_PAPER,
+}
+
+
+def state_file_for_mode(mode: str):
+    """Return the portfolio state file a given run mode must use.
+
+    Unknown modes fall back to the isolated sim file so that an accidental
+    new mode can never write to paper state.
+    """
+    return STATE_FILE_BY_MODE.get(mode, PORTFOLIO_STATE_FILE_SIM)
+
+
 ORDERS_FILE = OUTPUT_DIR / "orders.csv"
 DAILY_REPORT_FILE = OUTPUT_DIR / "daily_report.html"
 
@@ -46,11 +75,11 @@ MINIMUM_HISTORY = 200
 # ---------------------------------------------------------------------------
 
 THRESHOLD = 0.60
-TOP_N = 2
-MAX_POSITIONS = 2
+TOP_N = 5
+MAX_POSITIONS = 10
 STARTING_CAPITAL = 10000.0
-RISK_PER_TRADE = 0.01
-MAX_POSITION_FRAC = 0.40
+RISK_PER_TRADE = 0.004      # position size = equity * (RISK_PER_TRADE / STOP_LOSS_PCT) = ~8% of equity
+MAX_POSITION_FRAC = 0.30    # per-order cash cap; loose enough to fill the 10th position as cash depletes
 STOP_LOSS_PCT = 0.05
 TARGET_PROFIT_PCT = 0.10
 MAX_HOLD_DAYS = 20
