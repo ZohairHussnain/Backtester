@@ -19,7 +19,12 @@
 using json = nlohmann::json;
 using response = cpr::Response;
 
+// Keep exit code 3 for compatibility with existing debugging workflows that
+// already key off this process exit code on startup failure.
+constexpr int kExceptionExitCode = 3;
+
 int main() {
+	try {
 	int opt = 1;
 	std::string ticker = "AAPL";
 	std::string rr_ticker = "RR";
@@ -115,4 +120,15 @@ int main() {
 
 
 	return 0;
+	}
+	catch (const std::exception& e) {
+		std::cerr << "BackTester failed in main(): " << e.what()
+			<< " (check configuration and input data)" << std::endl;
+		return kExceptionExitCode;
+	}
+	catch (...) {
+		std::cerr << "BackTester failed in main(): unknown non-standard exception"
+			<< " (check configuration and input data)" << std::endl;
+		return kExceptionExitCode;
+	}
 }
