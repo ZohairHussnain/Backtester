@@ -32,6 +32,8 @@ from config import (
     state_file_for_mode,
     ORDERS_FILE, OUTPUT_DIR, STARTING_CAPITAL, THRESHOLD,
     SLIPPAGE, FEE_PER_SHARE, FEE_MIN, FEE_CAP_PCT,
+    IBKR_PAPER_STRATEGY_CAPITAL, IBKR_BUYING_POWER_SAFETY_FRAC,
+    floor_shares_for_ibkr,
 )
 from download_data import update_prices
 from feature_engine import get_latest_features, load_prices
@@ -378,15 +380,9 @@ def run_ibkr_dry_run(today: str):
     broker = create_broker("ibkr_dry_run")
 
     for _, order_row in orders.iterrows():
-        action = Action.BUY if order_row["action"] == "BUY" else Action.SELL
-        order = Order.create(
-            date=today, ticker=order_row["ticker"], action=action,
-            shares=order_row["shares"],
-            stop_price=order_row.get("stop_price", 0),
-            target_price=order_row.get("target_price", 0),
-            reason=order_row.get("reason", ""),
-            probability=order_row.get("probability", 0),
-        )
+        order = _build_ibkr_order(order_row, today)
+        if order is None:
+            continue
         try:
             broker.submit_order(order)
         except Exception as e:
@@ -440,15 +436,9 @@ def run_ibkr_paper(today: str):
 
     submitted_orders = []
     for _, order_row in orders.iterrows():
-        action = Action.BUY if order_row["action"] == "BUY" else Action.SELL
-        order = Order.create(
-            date=today, ticker=order_row["ticker"], action=action,
-            shares=order_row["shares"],
-            stop_price=order_row.get("stop_price", 0),
-            target_price=order_row.get("target_price", 0),
-            reason=order_row.get("reason", ""),
-            probability=order_row.get("probability", 0),
-        )
+        order = _build_ibkr_order(order_row, today)
+        if order is None:
+            continue
 
         # Duplicate checks
         if _has_pending_order(order.ticker, today):
@@ -600,6 +590,32 @@ def reset_sim_state(sim: Path = PORTFOLIO_STATE_FILE_SIM) -> list:
             p.unlink()
             removed.append(p)
     return removed
+
+
+def _build_ibkr_order(order_row, today: str):
+    """Build an Order for IBKR submission with whole-share enforcement.
+
+    IBKR rejects fractional quantities, so shares are floored to a whole number
+    HERE -- before logging, pre-flight notional, and reconciliation -- so every
+    downstream consumer sees the same integer the broker receives. Returns the
+    Order, or None if the quantity floors below one share (logged and skipped).
+
+    Accepts a pandas Series or a plain dict (both support [] and .get()).
+    """
+    action = Action.BUY if order_row["action"] == "BUY" else Action.SELL
+    raw_shares = order_row["shares"]
+    shares = floor_shares_for_ibkr(raw_shares)
+    if shares < 1:
+        print(f"    SKIP {order_row['ticker']}: {float(raw_shares):.4f} shares floor to {shares} (< 1)")
+        return None
+    return Order.create(
+        date=today, ticker=order_row["ticker"], action=action,
+        shares=shares,
+        stop_price=order_row.get("stop_price", 0),
+        target_price=order_row.get("target_price", 0),
+        reason=order_row.get("reason", ""),
+        probability=order_row.get("probability", 0),
+    )
 
 
 def _has_pending_order(ticker: str, today: str) -> bool:
