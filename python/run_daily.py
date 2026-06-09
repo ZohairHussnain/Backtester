@@ -126,68 +126,143 @@ def check_time_safety(args) -> None:
 # Pre-flight sanity checks (ibkr_paper only)
 # ======================================================================
 
-def preflight_checks(broker, portfolio: Portfolio) -> bool:
-    """Compare local state vs IBKR broker state. Return True if safe to proceed."""
+def _latest_close(ticker: str) -> float:
+    """Latest close price for a ticker, or 0.0 if unavailable."""
+    try:
+        return float(load_prices(ticker).iloc[-1]["close"])
+    except Exception:
+        return 0.0
+
+
+def _intended_buy_notional(orders):
+    """Sum the floored-share notional of today's BUY orders.
+
+    Uses the SAME integer share count the broker will receive, so the notional
+    reflects what we actually intend to spend. Returns (total, line_items).
+    """
+    total = 0.0
+    items = []
+    for _, o in orders.iterrows():
+        if o.get("action") != "BUY":
+            continue
+        ishares = floor_shares_for_ibkr(o.get("shares", 0))
+        if ishares < 1:
+            continue
+        price = _latest_close(o["ticker"])
+        notional = ishares * price
+        total += notional
+        items.append((o["ticker"], ishares, price, notional))
+    return total, items
+
+
+def preflight_checks(broker, portfolio: Portfolio, orders) -> bool:
+    """Verify it is safe to submit today's orders to IBKR paper.
+
+    Policy (the paper account is funded far above the strategy ledger by design):
+      - Equity mismatch is WARNING-ONLY (never blocks).
+      - Buying-power sufficiency is a HARD gate: intended BUY notional must fit
+        within IBKR_BUYING_POWER_SAFETY_FRAC of broker available funds.
+      - Position reconciliation (option B): the strategy owns only the tickers
+        in its ledger. Unrelated broker positions are ignored (logged). It is a
+        HARD failure if a strategy ticker is missing at the broker or its broker
+        share count disagrees with the ledger.
+
+    Returns True if safe to proceed.
+    """
     print("\n  Pre-flight sanity checks...")
     all_ok = True
 
-    # 1. Account value comparison
+    acct = {}
     try:
         acct = broker.get_account_state()
-        broker_equity = acct.get("NetLiquidation", 0)
-        broker_cash = acct.get("TotalCashValue", 0)
-        local_equity = portfolio.equity
-        local_cash = portfolio.cash
-
-        print(f"    Broker equity: ${broker_equity:,.2f}  |  Local equity: ${local_equity:,.2f}")
-        print(f"    Broker cash:   ${broker_cash:,.2f}  |  Local cash:   ${local_cash:,.2f}")
-
-        if broker_equity > 0 and local_equity > 0:
-            diff = abs(broker_equity - local_equity) / max(broker_equity, local_equity)
-            if diff > EQUITY_MISMATCH_TOLERANCE:
-                print(f"    FAIL: Equity mismatch {diff:.1%} exceeds {EQUITY_MISMATCH_TOLERANCE:.0%} tolerance.")
-                print(f"    Run --reconcile-only to sync state before submitting orders.")
-                all_ok = False
-            else:
-                print(f"    OK: Equity difference {diff:.1%} within tolerance.")
     except Exception as e:
-        print(f"    WARNING: Could not fetch account state ({e}). Skipping equity check.")
+        print(f"    WARNING: Could not fetch account state ({e}).")
 
-    # 2. Position comparison
+    broker_equity = acct.get("NetLiquidation", 0.0)
+    broker_cash = acct.get("TotalCashValue", 0.0)
+    broker_bp = acct.get("BuyingPower", broker_cash)
+    available = broker_bp if broker_bp > 0 else broker_cash
+    local_equity = portfolio.equity
+    local_cash = portfolio.cash
+
+    intended_notional, _ = _intended_buy_notional(orders)
+
+    # --- Structured state log ---
+    print("    --- account state ---")
+    print(f"    Broker equity (NetLiquidation): ${broker_equity:,.2f}")
+    print(f"    Broker cash (TotalCashValue):   ${broker_cash:,.2f}")
+    print(f"    Broker buying power:            ${broker_bp:,.2f}")
+    print(f"    Broker available funds:         ${available:,.2f}")
+    print(f"    Local strategy equity:          ${local_equity:,.2f}")
+    print(f"    Local strategy cash:            ${local_cash:,.2f}")
+    print(f"    Configured strategy capital:    ${IBKR_PAPER_STRATEGY_CAPITAL:,.2f}")
+    print(f"    Intended BUY notional:          ${intended_notional:,.2f}")
+    print("    ---------------------")
+
+    # 1. Equity mismatch -- WARNING ONLY.
+    if broker_equity > 0 and local_equity > 0:
+        diff = abs(broker_equity - local_equity) / max(broker_equity, local_equity)
+        if diff > EQUITY_MISMATCH_TOLERANCE:
+            print(f"    NOTE: broker/local equity differ {diff:.1%} -- expected "
+                  f"(strategy trades ${IBKR_PAPER_STRATEGY_CAPITAL:,.0f}, not the full "
+                  f"account). Not blocking.")
+
+    # 2. Buying-power sufficiency -- HARD GATE.
+    if intended_notional > 0:
+        budget = available * IBKR_BUYING_POWER_SAFETY_FRAC
+        if intended_notional > budget:
+            print(f"    FAIL: intended BUY notional ${intended_notional:,.2f} exceeds "
+                  f"{IBKR_BUYING_POWER_SAFETY_FRAC:.0%} of broker available funds "
+                  f"(${budget:,.2f}). Not enough buying power.")
+            all_ok = False
+        else:
+            print(f"    OK: buying power sufficient (need ${intended_notional:,.2f}, "
+                  f"budget ${budget:,.2f}).")
+
+    # 3. Position reconciliation -- option B (strategy owns only ledger tickers).
+    pos_ok = True
     try:
         broker_positions = broker.get_positions()
-        local_positions = set(portfolio.open_positions.keys())
         broker_tickers = set(broker_positions.keys())
+        local_positions = portfolio.open_positions
+        local_tickers = set(local_positions.keys())
 
-        broker_only = broker_tickers - local_positions
-        local_only = local_positions - broker_tickers
+        unrelated = broker_tickers - local_tickers
+        if unrelated:
+            print(f"    NOTE: ignoring {len(unrelated)} broker position(s) not owned "
+                  f"by this strategy: {sorted(unrelated)}")
 
-        if broker_only:
-            print(f"    FAIL: Broker has positions not in local state: {broker_only}")
-            print(f"    Run --reconcile-only to sync before submitting.")
+        missing_at_broker = local_tickers - broker_tickers
+        if missing_at_broker:
+            print(f"    FAIL: strategy holds positions absent at broker: "
+                  f"{sorted(missing_at_broker)}. Run --reconcile-only to sync.")
             all_ok = False
-        if local_only:
-            print(f"    FAIL: Local state has positions not at broker: {local_only}")
-            print(f"    Run --reconcile-only to sync before submitting.")
-            all_ok = False
-        if not broker_only and not local_only:
-            print(f"    OK: Positions match ({len(local_positions)} open).")
+            pos_ok = False
+
+        for t in sorted(local_tickers & broker_tickers):
+            local_sh = float(local_positions[t].get("shares", 0))
+            broker_sh = float(broker_positions[t].get("shares", 0))
+            if abs(local_sh - broker_sh) > 1e-6:
+                print(f"    FAIL: {t} share mismatch -- local {local_sh:g}, "
+                      f"broker {broker_sh:g}. Run --reconcile-only to sync.")
+                all_ok = False
+                pos_ok = False
+
+        if pos_ok:
+            print(f"    OK: strategy positions reconcile with broker "
+                  f"({len(local_tickers)} owned).")
     except Exception as e:
-        print(f"    WARNING: Could not fetch positions ({e}). Skipping position check.")
+        print(f"    FAIL: Could not fetch/verify positions ({e}). Blocking to be safe.")
+        all_ok = False
 
-    # 3. Open order check
+    # 4. Open order check -- informational.
     try:
         broker_orders = broker.get_open_orders()
         if broker_orders:
-            known_tickers = set()
-            unknown = []
-            for bo in broker_orders:
-                known_tickers.add(bo.get("ticker", ""))
-                # Check if this was submitted by us (hard to verify without order_id mapping)
-                unknown.append(f"{bo.get('action','')} {bo.get('shares','')} {bo.get('ticker','')}")
-            if unknown:
-                print(f"    WARNING: {len(broker_orders)} open orders at broker: {unknown}")
-                print(f"    These may conflict with today's submissions.")
+            desc = [f"{bo.get('action','')} {bo.get('shares','')} {bo.get('ticker','')}"
+                    for bo in broker_orders]
+            print(f"    WARNING: {len(broker_orders)} open order(s) at broker: {desc}. "
+                  f"These may conflict with today's submissions.")
         else:
             print(f"    OK: No open orders at broker.")
     except Exception as e:
@@ -221,22 +296,19 @@ def print_order_summary(orders, portfolio: Portfolio, broker) -> None:
         return
 
     total_value = 0.0
-    print(f"\n  Orders to submit:")
+    print(f"\n  Orders to submit (whole shares -- IBKR rejects fractions):")
     print(f"  {'Action':<6} {'Ticker':<8} {'Shares':>8} {'Est.Value':>12} {'Stop':>8} {'Target':>8} {'Prob':>6}")
     print(f"  {'-'*58}")
 
     for _, o in orders.iterrows():
-        shares = o.get("shares", 0)
-        # Estimate value from latest close
-        try:
-            prices = load_prices(o["ticker"])
-            price = prices.iloc[-1]["close"]
-        except Exception:
-            price = 0
-        est_val = shares * price
+        ishares = floor_shares_for_ibkr(o.get("shares", 0))
+        if ishares < 1:
+            continue  # skipped at submission; don't show a phantom line
+        price = _latest_close(o["ticker"])
+        est_val = ishares * price
         total_value += est_val if o.get("action") == "BUY" else 0
 
-        print(f"  {o.get('action',''):<6} {o.get('ticker',''):<8} {shares:>8.2f} "
+        print(f"  {o.get('action',''):<6} {o.get('ticker',''):<8} {ishares:>8d} "
               f"${est_val:>11,.2f} ${o.get('stop_price',0):>7.2f} "
               f"${o.get('target_price',0):>7.2f} {o.get('probability',0):>5.4f}")
 
@@ -373,7 +445,7 @@ def _apply_sim_orders(orders, portfolio: Portfolio, today: str) -> None:
 # ======================================================================
 
 def run_ibkr_dry_run(today: str):
-    portfolio = Portfolio(state_file_for_mode("ibkr_dry_run"), STARTING_CAPITAL)
+    portfolio = Portfolio(state_file_for_mode("ibkr_dry_run"), IBKR_PAPER_STRATEGY_CAPITAL)
     orders, predictions, _ = generate_signals_and_orders(portfolio, today)
 
     print("\n[6/7] IBKR DRY RUN -- NO ORDERS SUBMITTED...")
@@ -399,7 +471,7 @@ def run_ibkr_dry_run(today: str):
 # ======================================================================
 
 def run_ibkr_paper(today: str):
-    portfolio = Portfolio(state_file_for_mode("ibkr_paper"), STARTING_CAPITAL)
+    portfolio = Portfolio(state_file_for_mode("ibkr_paper"), IBKR_PAPER_STRATEGY_CAPITAL)
     is_duplicate = check_duplicate(portfolio, today)
 
     if is_duplicate:
@@ -418,7 +490,7 @@ def run_ibkr_paper(today: str):
     broker = create_broker("ibkr_paper")
 
     # --- Pre-flight checks ---
-    safe = preflight_checks(broker, portfolio)
+    safe = preflight_checks(broker, portfolio, orders)
     if not safe:
         print("\n  PRE-FLIGHT FAILED. Orders will NOT be submitted.")
         print("  Fix the issues above and re-run, or use --reconcile-only first.")
@@ -503,7 +575,7 @@ def run_reconcile_only(today: str):
     print("\n  Reconcile-only mode: fetching fills from IBKR...")
 
     # Reconciliation applies IBKR fills, so it operates on PAPER state.
-    portfolio = Portfolio(PORTFOLIO_STATE_FILE_PAPER, STARTING_CAPITAL)
+    portfolio = Portfolio(PORTFOLIO_STATE_FILE_PAPER, IBKR_PAPER_STRATEGY_CAPITAL)
     broker = create_broker("ibkr_dry_run")
 
     if not hasattr(broker, '_connected') or not broker._connected:

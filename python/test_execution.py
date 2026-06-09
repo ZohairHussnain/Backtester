@@ -163,6 +163,113 @@ def test_reconcile_partial_then_complete():
 
 
 # ---------------------------------------------------------------------------
+# Phase 2: buying-power pre-flight (option B positions)
+# ---------------------------------------------------------------------------
+
+class _FakeBroker:
+    def __init__(self, account, positions, open_orders=None):
+        self._account = account
+        self._positions = positions
+        self._open = open_orders or []
+
+    def get_account_state(self):
+        return self._account
+
+    def get_positions(self):
+        return self._positions
+
+    def get_open_orders(self):
+        return self._open
+
+
+class _FakePortfolio:
+    def __init__(self, cash, positions=None):
+        self._cash = cash
+        self._pos = positions or {}
+
+    @property
+    def cash(self):
+        return self._cash
+
+    @property
+    def equity(self):
+        return self._cash + sum(p["shares"] * p["entry_price"] for p in self._pos.values())
+
+    @property
+    def open_positions(self):
+        return self._pos
+
+
+def _orders_df(rows):
+    import pandas as pd
+    cols = ["date", "ticker", "action", "shares", "stop_price", "target_price", "probability"]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _preflight(broker, portfolio, orders, prices):
+    """Run preflight with _latest_close monkeypatched to a price dict."""
+    import run_daily
+    orig = run_daily._latest_close
+    run_daily._latest_close = lambda t: float(prices.get(t, 0.0))
+    try:
+        return run_daily.preflight_checks(broker, portfolio, orders)
+    finally:
+        run_daily._latest_close = orig
+
+
+def test_preflight_huge_broker_equity_not_blocked():
+    print("\n[P2-A] broker equity >> local does not block")
+    broker = _FakeBroker({"NetLiquidation": 1_000_000, "TotalCashValue": 1_000_000,
+                          "BuyingPower": 4_000_000}, positions={})
+    pf = _FakePortfolio(cash=10_000)
+    orders = _orders_df([["2026-06-09", "AAPL", "BUY", 10.0, 95, 110, 0.7]])
+    ok = _preflight(broker, pf, orders, {"AAPL": 150.0})  # notional 1500
+    check(ok is True, "passes despite 99% equity gap (buying power ample)")
+
+
+def test_preflight_insufficient_buying_power():
+    print("\n[P2-B] insufficient buying power blocks")
+    broker = _FakeBroker({"NetLiquidation": 2_000, "TotalCashValue": 1_000,
+                          "BuyingPower": 1_000}, positions={})
+    pf = _FakePortfolio(cash=10_000)
+    orders = _orders_df([["2026-06-09", "AAPL", "BUY", 100.0, 95, 110, 0.7]])
+    ok = _preflight(broker, pf, orders, {"AAPL": 150.0})  # notional 15000 >> 950
+    check(ok is False, "blocks when intended notional exceeds 95% of available funds")
+
+
+def test_preflight_strategy_ticker_mismatch_blocks():
+    print("\n[P2-C] share mismatch on an owned ticker blocks")
+    broker = _FakeBroker({"NetLiquidation": 1_000_000, "TotalCashValue": 1_000_000,
+                          "BuyingPower": 4_000_000},
+                         positions={"AAPL": {"shares": 5, "avg_price": 150}})
+    pf = _FakePortfolio(cash=9_000, positions={"AAPL": {"shares": 10, "entry_price": 150}})
+    orders = _orders_df([])  # no new orders; just reconciling
+    ok = _preflight(broker, pf, orders, {})
+    check(ok is False, "local 10 vs broker 5 shares on AAPL blocks")
+
+
+def test_preflight_unrelated_broker_position_ignored():
+    print("\n[P2-D] unrelated broker positions are ignored (option B)")
+    broker = _FakeBroker({"NetLiquidation": 1_000_000, "TotalCashValue": 1_000_000,
+                          "BuyingPower": 4_000_000},
+                         positions={"AAPL": {"shares": 10, "avg_price": 150},
+                                    "TSLA": {"shares": 99, "avg_price": 200}})  # not ours
+    pf = _FakePortfolio(cash=8_500, positions={"AAPL": {"shares": 10, "entry_price": 150}})
+    orders = _orders_df([["2026-06-09", "MSFT", "BUY", 5.0, 95, 110, 0.7]])
+    ok = _preflight(broker, pf, orders, {"MSFT": 300.0})  # notional 1500
+    check(ok is True, "TSLA (broker-only) ignored; owned AAPL matches -> passes")
+
+
+def test_preflight_strategy_ticker_missing_at_broker_blocks():
+    print("\n[P2-E] owned ticker absent at broker blocks")
+    broker = _FakeBroker({"NetLiquidation": 1_000_000, "TotalCashValue": 1_000_000,
+                          "BuyingPower": 4_000_000}, positions={})
+    pf = _FakePortfolio(cash=8_500, positions={"AAPL": {"shares": 10, "entry_price": 150}})
+    ok = _preflight(broker, pf, _orders_df([]), {})
+    check(ok is False, "strategy holds AAPL but broker has none -> blocks")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -174,6 +281,11 @@ def main():
     test_reconcile_is_idempotent()
     test_reconcile_skips_unexpected_fill()
     test_reconcile_partial_then_complete()
+    test_preflight_huge_broker_equity_not_blocked()
+    test_preflight_insufficient_buying_power()
+    test_preflight_strategy_ticker_mismatch_blocks()
+    test_preflight_unrelated_broker_position_ignored()
+    test_preflight_strategy_ticker_missing_at_broker_blocks()
 
     print(f"\n{'='*50}")
     print(f"  {_passed} passed, {_failed} failed")
