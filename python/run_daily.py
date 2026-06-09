@@ -460,12 +460,15 @@ def run_ibkr_paper(today: str):
 
         try:
             broker.submit_order(order)
+            # Persist immediately (with broker_order_id) so a crash between
+            # submission and reconciliation still leaves a reconcilable record.
+            om.log_orders([order])
             submitted_orders.append(order)
             print(f"    SUBMITTED: {order.action.value} {order.shares:.0f} {order.ticker}")
         except Exception as e:
+            # submit_order set status=REJECTED before raising; persist for audit.
+            om.log_orders([order])
             print(f"    REJECTED {order.ticker}: {e}")
-
-    om.log_orders(submitted_orders)
 
     # Check for immediate fills
     print("\n  Checking for immediate fills...")
@@ -522,7 +525,12 @@ def run_reconcile_only(today: str):
     if lifecycle_path.exists():
         import pandas as pd
         df = pd.read_csv(lifecycle_path)
-        for _, row in df[df["status"].isin(["SUBMITTED", "PENDING"])].iterrows():
+        # PARTIALLY_FILLED orders may still receive more executions, so they are
+        # reconcilable too.
+        reconcilable = ["SUBMITTED", "PENDING", "PARTIALLY_FILLED"]
+        for _, row in df[df["status"].isin(reconcilable)].iterrows():
+            bid = row.get("broker_order_id")
+            broker_order_id = str(bid) if pd.notna(bid) else None
             pending_orders.append(Order(
                 order_id=row["order_id"], date=row["date"], ticker=row["ticker"],
                 action=Action(row["action"]), shares=row["shares"],
@@ -530,6 +538,7 @@ def run_reconcile_only(today: str):
                 stop_price=row.get("stop_price", 0),
                 target_price=row.get("target_price", 0),
                 status=OrderStatus(row["status"]), reason=row.get("reason", ""),
+                broker_order_id=broker_order_id,
             ))
 
     fills = reconciler.reconcile(broker_fills, pending_orders)
