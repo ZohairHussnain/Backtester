@@ -85,6 +85,38 @@ TARGET_PROFIT_PCT = 0.10
 MAX_HOLD_DAYS = 20
 
 # ---------------------------------------------------------------------------
+# IBKR paper trading
+# ---------------------------------------------------------------------------
+
+# The IBKR paper account is funded far above what this strategy should trade
+# (e.g. ~$1,000,000). The strategy ledger (portfolio_state.paper.json) is sized
+# independently from the broker balance: we use the broker ONLY for execution
+# and position verification, never to size positions off the full account.
+IBKR_PAPER_STRATEGY_CAPITAL = 10000.0
+
+# Pre-flight commits at most this fraction of broker available funds. Acts as a
+# buying-power sufficiency gate (not an equity-equality gate).
+IBKR_BUYING_POWER_SAFETY_FRAC = 0.95
+
+# IBKR rejects fractional share orders, so every IBKR-bound order is floored to
+# a whole number and dropped if it rounds below one share.
+ALLOW_FRACTIONAL_IBKR = False
+
+
+def floor_shares_for_ibkr(shares: float) -> int:
+    """Floor a (possibly fractional) share count to whole shares for IBKR.
+
+    Single source of truth for integer-share enforcement. Returns 0 for any
+    quantity that rounds below one share so the caller can skip the order.
+    Negative inputs clamp to 0 (no shorting via sizing bugs).
+    """
+    import math
+    if shares != shares or shares <= 0:  # NaN or non-positive
+        return 0
+    return int(math.floor(shares))
+
+
+# ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
 
