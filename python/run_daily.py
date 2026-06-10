@@ -690,20 +690,25 @@ def run_ibkr_paper(today: str, order_type: str = "MOO", allow_stale: bool = Fals
             continue
 
         try:
-            broker.submit_order(order)
+            broker.submit_order(order)  # logs its own SUBMITTED line with the broker id
             submitted_orders.append(order)
-            print(f"    SUBMITTED: {order.action.value} {order.shares:.0f} {order.ticker}")
         except Exception as e:
             print(f"    REJECTED {order.ticker}: {e}")
 
     om.log_orders(submitted_orders)
 
-    # Check for immediate fills
-    print("\n  Checking for immediate fills...")
-    broker_fills = broker.get_fills()
+    # Immediate-fill handling.
+    #
+    # MOO orders CANNOT fill before the open, so we never reconcile them here:
+    # ib.fills() returns the account's whole recent execution history, and
+    # applying any of it now would attach stale fills to today's pending orders.
+    # MOO fills are picked up by --reconcile-only after the open (matched on
+    # perm_id). Only MKT orders (run during RTH) can fill immediately.
     applied = []
-    if broker_fills:
-        fills = reconciler.reconcile(broker_fills, submitted_orders)
+    if order_type == "MKT":
+        print("\n  Checking for immediate fills...")
+        broker_fills = broker.get_fills()
+        fills = reconciler.reconcile(broker_fills, submitted_orders) if broker_fills else []
         for fill in fills:
             try:
                 if apply_fill(portfolio, fill, today):
@@ -712,12 +717,12 @@ def run_ibkr_paper(today: str, order_type: str = "MOO", allow_stale: bool = Fals
                           f"{fill.ticker} @ ${fill.fill_price:.2f}")
             except Exception as e:
                 print(f"    FILL ERROR {fill.ticker}: {e}")
-    elif order_type == "MKT":
-        print("  No immediate fills yet. MKT orders should fill within seconds during RTH.")
-        print("  Run --reconcile-only shortly to fetch fills.")
+        if not applied:
+            print("  No immediate fills yet. MKT orders fill within seconds during RTH.")
+        print("  Run --reconcile-only shortly to fetch any remaining fills.")
     else:
-        print("  No immediate fills (MOO orders fill at market open).")
-        print("  Run --reconcile-only after market open to fetch fills.")
+        print("\n  MOO orders submitted. They fill at the market open.")
+        print("  Run --reconcile-only after the open to fetch fills.")
 
     broker.disconnect()
     # Save state (commits processed_fill_ids atomically) BEFORE writing the

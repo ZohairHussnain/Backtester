@@ -1,10 +1,13 @@
 """FillReconciler: match broker fills to orders, produce Fill records.
 
-Matching strategy (in priority order), because IBKR's per-session orderId is
-unreliable (often 0 for executions queried in a later API session):
+Matching strategy (stable broker ids ONLY), because IBKR's per-session orderId
+is unreliable (often 0 for executions queried in a later API session):
   1. perm_id        — IBKR's stable cross-session order id
   2. broker_order_id — the orderId captured at submit time
-  3. (ticker, action) — last-resort match against a single pending order
+
+There is deliberately NO ticker/action fallback: ib.fills() returns the whole
+account execution history (including fills from earlier runs), so matching by
+ticker would attach a stale same-ticker fill to a freshly submitted order.
 
 Idempotency is NOT owned here. The reconciler only de-duplicates identical
 execution ids WITHIN a single fetch. Cross-run idempotency is owned by the
@@ -29,6 +32,11 @@ class FillReconciler:
         perm_id = str(bf.get("perm_id") or "")
         order_id = str(bf.get("order_id") or "")
 
+        # Match ONLY on stable broker ids. ib.fills() returns the account's whole
+        # recent execution history (including fills from previous runs), so a
+        # loose ticker/action fallback would wrongly attach a stale same-ticker
+        # fill to a freshly submitted order. perm_id (and the submit-time
+        # broker_order_id) uniquely identify our own orders; nothing else may.
         if perm_id:
             for o in pending_orders:
                 if o.perm_id and str(o.perm_id) == perm_id:
@@ -37,13 +45,6 @@ class FillReconciler:
             for o in pending_orders:
                 if o.broker_order_id and str(o.broker_order_id) == order_id:
                     return o
-        # Last resort: a single pending order matching ticker + action.
-        ticker = bf.get("ticker")
-        action = bf.get("action")
-        candidates = [o for o in pending_orders
-                      if o.ticker == ticker and o.action.value == action]
-        if len(candidates) == 1:
-            return candidates[0]
         return None
 
     def reconcile(self, broker_fills: list[dict],

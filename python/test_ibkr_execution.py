@@ -208,6 +208,19 @@ def test_reconcile_unmatched_is_skipped():
     check(len(fills) == 0, "unmatched fill produced no Fill")
 
 
+def test_stale_same_ticker_fill_not_matched():
+    print("\n[I2] a stale same-ticker fill (different perm_id) is NOT matched")
+    r = FillReconciler(None)
+    order = _order("NFLX", "BUY", 9, perm_id="P_today", broker_order_id="26")
+    # ib.fills() returns an old NFLX execution from a previous run: same
+    # ticker+action, but a different order's ids (orderId came back as 0).
+    stale = _broker_fill("NFLX", "BUY", 9, 86.46, fill_id="OLD1",
+                         perm_id="P_old", order_id="0")
+    fills = r.reconcile([stale], [order])
+    check(len(fills) == 0, "stale NFLX fill does not attach to today's NFLX order")
+    check(order.status != OrderStatus.FILLED, "today's order not marked filled by a stale fill")
+
+
 def test_partial_fills_accumulate():
     print("\n[J] partial fills accumulate to FILLED")
     r = FillReconciler(None)
@@ -504,6 +517,7 @@ def main():
     test_build_ibkr_order_is_integer_or_skipped()
     test_reconcile_matches_on_permid_when_orderid_zero()
     test_reconcile_unmatched_is_skipped()
+    test_stale_same_ticker_fill_not_matched()
     test_partial_fills_accumulate()
     test_partial_buy_then_sell_in_portfolio()
     test_duplicate_reconciliation_is_idempotent()
