@@ -174,12 +174,20 @@ class IBKRBroker(BrokerAdapter):
 
         side = "BUY" if order.action == Action.BUY else "SELL"
         ib_order = MarketOrder(side, shares)
-        ib_order.tif = "OPG"        # Time-in-force: market-on-open
+        # Time-in-force from the order type: MKT = immediate market order valid
+        # for the day (run during RTH); otherwise market-on-open (pre-market).
+        if order.order_type == "MKT":
+            ib_order.tif = "DAY"
+        else:
+            ib_order.tif = "OPG"
         ib_order.outsideRth = False  # No extended hours
+        type_label = order.order_type
 
         if self.dry_run:
-            self._log_order(order, "DRY_RUN", "DRY-0", f"Would submit {side} {shares} {order.ticker} MOO")
-            print(f"    [DRY RUN] {side} {shares} {order.ticker} MOO (prob={order.probability:.4f})")
+            self._log_order(order, "DRY_RUN", "DRY-0",
+                            f"Would submit {side} {shares} {order.ticker} {type_label}")
+            print(f"    [DRY RUN] {side} {shares} {order.ticker} {type_label} "
+                  f"(prob={order.probability:.4f})")
             order.status = OrderStatus.PENDING
             return "DRY-0"
 
@@ -200,8 +208,9 @@ class IBKRBroker(BrokerAdapter):
 
             status = trade.orderStatus.status
             self._log_order(order, status, broker_id,
-                          f"Submitted {side} {shares} {order.ticker} MOO permId={perm_id}")
-            print(f"    SUBMITTED: {side} {shares} {order.ticker} MOO -> orderId={broker_id} ({status})")
+                          f"Submitted {side} {shares} {order.ticker} {type_label} permId={perm_id}")
+            print(f"    SUBMITTED: {side} {shares} {order.ticker} {type_label} "
+                  f"-> orderId={broker_id} ({status})")
             return broker_id
 
         except Exception as e:

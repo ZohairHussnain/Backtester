@@ -6,12 +6,22 @@ Usage:
     python run_daily.py --mode sim                   # simulated fills
     python run_daily.py --mode ibkr_dry_run          # connect IBKR, log orders, no submission
     python run_daily.py --mode ibkr_paper --confirm-paper-orders  # submit MOO to IBKR paper
+    python run_daily.py --mode ibkr_paper --confirm-paper-orders --market-hours
+                                                     # submit immediate MKT orders during RTH
     python run_daily.py --reconcile-only             # fetch fills, update state, no new orders
+
+Order timing:
+    - Default: pre-market MOO (market-on-open, TIF=OPG). Submission window is
+      04:00-09:25 ET. These fill at the next open.
+    - --market-hours: immediate MKT orders (TIF=DAY) for running DURING regular
+      trading hours (09:30-16:00 ET). These fill right away, so reconcile in the
+      same run instead of waiting for the open.
 
 Safety (ibkr_paper):
     - Requires --confirm-paper-orders to submit any order.
-    - Hard-blocked outside 04:00-09:25 ET unless BOTH --override-time-check
-      AND --i-understand-time-risk are passed.
+    - Hard-blocked outside the active submission window (04:00-09:25 ET for MOO,
+      09:30-16:00 ET for --market-hours) unless BOTH --override-time-check AND
+      --i-understand-time-risk are passed.
     - Pre-flight checks compare local portfolio state vs IBKR broker state.
     - Mismatches block submission until reconciled.
 """
@@ -53,6 +63,12 @@ MOO_WINDOW_START_MIN = 0
 MOO_WINDOW_END_HOUR = 9
 MOO_WINDOW_END_MIN = 25
 
+# Regular trading hours window (ET) — used by --market-hours for immediate MKT orders.
+RTH_START_HOUR = 9
+RTH_START_MIN = 30
+RTH_END_HOUR = 16
+RTH_END_MIN = 0
+
 # Tolerance for local vs broker equity mismatch (fraction)
 EQUITY_MISMATCH_TOLERANCE = 0.10
 
@@ -87,20 +103,44 @@ def is_in_moo_window() -> bool:
     return start <= now <= end
 
 
+def is_in_rth() -> bool:
+    """Check if current ET time is within regular trading hours (09:30-16:00 ET)."""
+    now = get_et_now()
+    start = now.replace(hour=RTH_START_HOUR, minute=RTH_START_MIN, second=0)
+    end = now.replace(hour=RTH_END_HOUR, minute=RTH_END_MIN, second=0)
+    return start <= now <= end
+
+
 def check_time_safety(args) -> None:
-    """Hard-block ibkr_paper outside MOO window unless both override flags are set."""
+    """Hard-block ibkr_paper outside the active submission window unless both
+    override flags are set.
+
+    The active window depends on the order type:
+      - default (MOO):     04:00-09:25 ET pre-market
+      - --market-hours (MKT): 09:30-16:00 ET regular trading hours
+    """
     now_et = get_et_now()
-    in_window = is_in_moo_window()
     time_str = now_et.strftime("%H:%M:%S ET")
 
+    if getattr(args, "market_hours", False):
+        in_window = is_in_rth()
+        window_label = "RTH"
+        window_desc = "09:30-16:00 ET"
+        order_desc = "MKT orders"
+    else:
+        in_window = is_in_moo_window()
+        window_label = "MOO"
+        window_desc = "04:00-09:25 ET"
+        order_desc = "MOO orders"
+
     if in_window:
-        print(f"  Time check: {time_str} -- within MOO window (04:00-09:25 ET). OK.")
+        print(f"  Time check: {time_str} -- within {window_label} window ({window_desc}). OK.")
         return
 
-    print(f"  Time check: {time_str} -- OUTSIDE MOO window (04:00-09:25 ET).")
+    print(f"  Time check: {time_str} -- OUTSIDE {window_label} window ({window_desc}).")
 
     if args.mode == "ibkr_dry_run":
-        print(f"  WARNING: Outside MOO window. Dry-run proceeds (no orders submitted).")
+        print(f"  WARNING: Outside {window_label} window. Dry-run proceeds (no orders submitted).")
         return
 
     if args.mode == "ibkr_paper":
@@ -110,13 +150,13 @@ def check_time_safety(args) -> None:
             return
         elif args.override_time_check:
             print(f"  BLOCKED: --override-time-check alone is insufficient.")
-            print(f"  You must also pass --i-understand-time-risk to submit outside MOO window.")
+            print(f"  You must also pass --i-understand-time-risk to submit outside the {window_label} window.")
             log_run(args.mode, "BLOCKED", f"missing --i-understand-time-risk at {time_str}")
             sys.exit(1)
         else:
-            print(f"  BLOCKED: MOO orders must be submitted between 04:00-09:25 ET.")
+            print(f"  BLOCKED: {order_desc} must be submitted between {window_desc}.")
             print(f"  To override, pass BOTH --override-time-check AND --i-understand-time-risk.")
-            log_run(args.mode, "BLOCKED", f"outside MOO window at {time_str}")
+            log_run(args.mode, "BLOCKED", f"outside {window_label} window at {time_str}")
             sys.exit(1)
 
 
@@ -451,13 +491,16 @@ def floor_shares_for_ibkr(shares) -> int:
         return 0
 
 
-def build_ibkr_order(order_row, today: str):
+def build_ibkr_order(order_row, today: str, order_type: str = "MOO"):
     """Build an integer-share Order for IBKR, or None if it should be skipped.
 
     Shares are floored to whole units. Orders that floor to < 1 share return
     None so the caller can skip and log them. This is the single place where
     IBKR-bound order quantities are made integer — both dry-run and paper go
     through here, so the lifecycle log, summary, and submission all agree.
+
+    order_type selects the IBKR time-in-force at submission: "MOO" (pre-market
+    market-on-open) or "MKT" (immediate market order during trading hours).
     """
     shares = floor_shares_for_ibkr(order_row["shares"])
     if shares < 1:
@@ -470,6 +513,7 @@ def build_ibkr_order(order_row, today: str):
         target_price=order_row.get("target_price", 0),
         reason=order_row.get("reason", ""),
         probability=order_row.get("probability", 0),
+        order_type=order_type,
     )
 
 
@@ -477,15 +521,15 @@ def build_ibkr_order(order_row, today: str):
 # Mode: ibkr_dry_run
 # ======================================================================
 
-def run_ibkr_dry_run(today: str):
+def run_ibkr_dry_run(today: str, order_type: str = "MOO"):
     portfolio = Portfolio(state_file_for_mode("ibkr_dry_run"), IBKR_PAPER_STRATEGY_CAPITAL)
     orders, predictions, _ = generate_signals_and_orders(portfolio, today)
 
-    print("\n[6/7] IBKR DRY RUN -- NO ORDERS SUBMITTED...")
+    print(f"\n[6/7] IBKR DRY RUN ({order_type}) -- NO ORDERS SUBMITTED...")
     broker = create_broker("ibkr_dry_run")
 
     for _, order_row in orders.iterrows():
-        order = build_ibkr_order(order_row, today)
+        order = build_ibkr_order(order_row, today, order_type)
         if order is None:
             print(f"    DRY RUN skip {order_row['ticker']}: "
                   f"{order_row['shares']} shares floors to < 1")
@@ -505,7 +549,7 @@ def run_ibkr_dry_run(today: str):
 # Mode: ibkr_paper
 # ======================================================================
 
-def run_ibkr_paper(today: str):
+def run_ibkr_paper(today: str, order_type: str = "MOO"):
     portfolio = Portfolio(state_file_for_mode("ibkr_paper"), IBKR_PAPER_STRATEGY_CAPITAL)
     is_duplicate = check_duplicate(portfolio, today)
 
@@ -543,7 +587,7 @@ def run_ibkr_paper(today: str):
 
     submitted_orders = []
     for _, order_row in orders.iterrows():
-        order = build_ibkr_order(order_row, today)
+        order = build_ibkr_order(order_row, today, order_type)
         if order is None:
             print(f"    SKIP {order_row['ticker']}: "
                   f"{order_row['shares']} shares floors to < 1")
@@ -590,6 +634,9 @@ def run_ibkr_paper(today: str):
                           f"{fill.ticker} @ ${fill.fill_price:.2f}")
             except Exception as e:
                 print(f"    FILL ERROR {fill.ticker}: {e}")
+    elif order_type == "MKT":
+        print("  No immediate fills yet. MKT orders should fill within seconds during RTH.")
+        print("  Run --reconcile-only shortly to fetch fills.")
     else:
         print("  No immediate fills (MOO orders fill at market open).")
         print("  Run --reconcile-only after market open to fetch fills.")
@@ -794,6 +841,10 @@ def parse_args():
                        default="sim", help="Execution mode (default: sim)")
     parser.add_argument("--confirm-paper-orders", action="store_true",
                        help="Required flag to submit IBKR paper orders")
+    parser.add_argument("--market-hours", action="store_true",
+                       help="Submit immediate MKT orders (TIF=DAY) for running during "
+                            "regular trading hours (09:30-16:00 ET) instead of pre-market "
+                            "MOO orders. Changes the allowed submission window to RTH.")
     parser.add_argument("--reconcile-only", action="store_true",
                        help="Fetch fills from IBKR, update portfolio, no new orders")
     parser.add_argument("--override-time-check", action="store_true",
@@ -850,13 +901,15 @@ def main():
 
     log_run(args.mode, "START", f"mode={args.mode}")
 
+    order_type = "MKT" if args.market_hours else "MOO"
+
     try:
         if args.mode == "sim":
             run_sim(today)
         elif args.mode == "ibkr_dry_run":
-            run_ibkr_dry_run(today)
+            run_ibkr_dry_run(today, order_type)
         elif args.mode == "ibkr_paper":
-            run_ibkr_paper(today)
+            run_ibkr_paper(today, order_type)
 
         log_run(args.mode, "COMPLETE", "success")
     except Exception as e:

@@ -47,11 +47,12 @@ class Order:
     @staticmethod
     def create(date: str, ticker: str, action: Action, shares: float,
                stop_price: float, target_price: float, reason: str,
-               probability: float = 0.0, rank: int = 0) -> "Order":
+               probability: float = 0.0, rank: int = 0,
+               order_type: str = "MOO") -> "Order":
         return Order(
             order_id=str(uuid.uuid4())[:8],
             date=date, ticker=ticker, action=action, shares=shares,
-            order_type="MOO", stop_price=stop_price, target_price=target_price,
+            order_type=order_type, stop_price=stop_price, target_price=target_price,
             status=OrderStatus.PENDING, reason=reason,
             probability=probability, rank=rank,
             created_at=datetime.now().isoformat(),

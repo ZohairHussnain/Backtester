@@ -171,6 +171,14 @@ cd python
 python run_daily.py --mode ibkr_paper --confirm-paper-orders
 ```
 
+**Running during regular trading hours?** Add `--market-hours` to submit immediate **MKT** orders (TIF=DAY) instead of pre-market MOO orders. This changes the allowed submission window from `04:00–09:25 ET` to `09:30–16:00 ET`:
+
+```powershell
+python run_daily.py --mode ibkr_paper --confirm-paper-orders --market-hours
+```
+
+MKT orders fill within seconds, so you can reconcile in the same session a moment later rather than waiting for the next open. The same `--override-time-check` + `--i-understand-time-risk` pair is required to submit outside `09:30–16:00 ET` in this mode. `--market-hours` also works with `--mode ibkr_dry_run` to preview MKT orders.
+
 Guardrails enforced, in order:
 - `--confirm-paper-orders` is **required**; without it the run aborts.
 - Hard-blocked outside **04:00–09:25 ET** unless you pass *both* `--override-time-check` and `--i-understand-time-risk`.

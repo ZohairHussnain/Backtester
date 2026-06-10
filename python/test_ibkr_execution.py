@@ -10,6 +10,8 @@ reads or writes the real output/ state files.
 
 import sys
 import tempfile
+import types
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -83,6 +85,22 @@ def _broker_fill(ticker, action, shares, price, fill_id, perm_id="", order_id="0
         "ticker": ticker, "action": action, "shares_filled": shares,
         "fill_price": price, "commission": commission, "filled_at": "2026-06-10T09:30:00",
     }
+
+
+def _fixed_et(hour, minute=0):
+    """Pin run_daily.get_et_now to a fixed ET wall-clock time."""
+    def _now():
+        return datetime(2026, 6, 10, hour, minute, 0, tzinfo=run_daily.ET)
+    return _now
+
+
+def _args(mode="ibkr_paper", market_hours=False,
+          override_time_check=False, i_understand_time_risk=False):
+    return types.SimpleNamespace(
+        mode=mode, market_hours=market_hours,
+        override_time_check=override_time_check,
+        i_understand_time_risk=i_understand_time_risk,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +325,85 @@ def test_paper_state_only_mutates_from_fills():
 
 
 # ---------------------------------------------------------------------------
+# Market-hours flag: order type + submission window
+# ---------------------------------------------------------------------------
+
+def test_order_type_plumbing():
+    print("\n[Q] build_ibkr_order carries the requested order type")
+    default = run_daily.build_ibkr_order(
+        {"ticker": "AAA", "action": "BUY", "shares": 5,
+         "stop_price": 1, "target_price": 2}, "2026-06-10")
+    check(default.order_type == "MOO", "default order type is MOO")
+    mkt = run_daily.build_ibkr_order(
+        {"ticker": "AAA", "action": "BUY", "shares": 5,
+         "stop_price": 1, "target_price": 2}, "2026-06-10", "MKT")
+    check(mkt.order_type == "MKT", "explicit MKT order type is carried through")
+
+
+def test_window_detection():
+    print("\n[R] RTH vs MOO window detection")
+    saved = run_daily.get_et_now
+    try:
+        run_daily.get_et_now = _fixed_et(10, 0)   # 10:00 ET
+        check(run_daily.is_in_rth() is True, "10:00 ET is within RTH")
+        check(run_daily.is_in_moo_window() is False, "10:00 ET is outside MOO window")
+        run_daily.get_et_now = _fixed_et(5, 0)     # 05:00 ET
+        check(run_daily.is_in_moo_window() is True, "05:00 ET is within MOO window")
+        check(run_daily.is_in_rth() is False, "05:00 ET is outside RTH")
+    finally:
+        run_daily.get_et_now = saved
+
+
+def test_time_safety_market_hours_during_rth_proceeds():
+    print("\n[S] --market-hours during RTH is allowed without overrides")
+    saved_now, saved_log = run_daily.get_et_now, run_daily.log_run
+    try:
+        run_daily.get_et_now = _fixed_et(10, 0)
+        run_daily.log_run = lambda *a, **k: None
+        ok = True
+        try:
+            run_daily.check_time_safety(_args(market_hours=True))
+        except SystemExit:
+            ok = False
+        check(ok is True, "market-hours run at 10:00 ET proceeds (no block)")
+    finally:
+        run_daily.get_et_now, run_daily.log_run = saved_now, saved_log
+
+
+def test_time_safety_moo_during_rth_blocks():
+    print("\n[T] default MOO during RTH is blocked (wrong window)")
+    saved_now, saved_log = run_daily.get_et_now, run_daily.log_run
+    try:
+        run_daily.get_et_now = _fixed_et(10, 0)
+        run_daily.log_run = lambda *a, **k: None
+        blocked = False
+        try:
+            run_daily.check_time_safety(_args(market_hours=False))
+        except SystemExit:
+            blocked = True
+        check(blocked is True, "MOO run at 10:00 ET is blocked (outside 04:00-09:25)")
+    finally:
+        run_daily.get_et_now, run_daily.log_run = saved_now, saved_log
+
+
+def test_time_safety_overrides_proceed_outside_window():
+    print("\n[U] both override flags proceed outside the window")
+    saved_now, saved_log = run_daily.get_et_now, run_daily.log_run
+    try:
+        run_daily.get_et_now = _fixed_et(20, 0)  # 20:00 ET, outside both windows
+        run_daily.log_run = lambda *a, **k: None
+        ok = True
+        try:
+            run_daily.check_time_safety(_args(
+                market_hours=True, override_time_check=True, i_understand_time_risk=True))
+        except SystemExit:
+            ok = False
+        check(ok is True, "both override flags allow submission outside RTH")
+    finally:
+        run_daily.get_et_now, run_daily.log_run = saved_now, saved_log
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -331,6 +428,11 @@ def main():
     test_reconcile_full_flow_idempotent_via_reconciler_and_portfolio()
     test_reconcile_does_not_mutate_portfolio()
     test_paper_state_only_mutates_from_fills()
+    test_order_type_plumbing()
+    test_window_detection()
+    test_time_safety_market_hours_during_rth_proceeds()
+    test_time_safety_moo_during_rth_blocks()
+    test_time_safety_overrides_proceed_outside_window()
 
     print("\n" + "=" * 60)
     print(f"  RESULTS: {_passed} passed, {_failed} failed")
