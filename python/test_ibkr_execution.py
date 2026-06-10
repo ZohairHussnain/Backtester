@@ -404,6 +404,61 @@ def test_time_safety_overrides_proceed_outside_window():
 
 
 # ---------------------------------------------------------------------------
+# Stale-price guard
+# ---------------------------------------------------------------------------
+
+def _exits(fn, *args, **kwargs):
+    """Call fn; return True if it raised SystemExit, False otherwise."""
+    saved_log = run_daily.log_run
+    run_daily.log_run = lambda *a, **k: None
+    try:
+        fn(*args, **kwargs)
+        return False
+    except SystemExit:
+        return True
+    finally:
+        run_daily.log_run = saved_log
+
+
+def test_fresh_data_passes():
+    print("\n[V] fresh data passes the staleness guard")
+    blocked = _exits(run_daily.check_data_freshness, "2026-06-09", "2026-06-10",
+                     "ibkr_paper", False)
+    check(blocked is False, "1-day-old bar does not block ibkr_paper")
+
+
+def test_stale_data_blocks_paper():
+    print("\n[W] stale data blocks ibkr_paper")
+    blocked = _exits(run_daily.check_data_freshness, "2026-05-01", "2026-06-10",
+                     "ibkr_paper", False)
+    check(blocked is True, "40-day-old bar blocks ibkr_paper submission")
+
+
+def test_stale_data_warns_only_in_sim():
+    print("\n[X] stale data warns but does not block non-paper modes")
+    blocked = _exits(run_daily.check_data_freshness, "2026-05-01", "2026-06-10",
+                     "sim", False)
+    check(blocked is False, "sim mode warns only, never blocks")
+    blocked_dry = _exits(run_daily.check_data_freshness, "2026-05-01", "2026-06-10",
+                         "ibkr_dry_run", False)
+    check(blocked_dry is False, "dry-run warns only, never blocks")
+
+
+def test_allow_stale_override():
+    print("\n[Y] --allow-stale-data overrides the paper block")
+    blocked = _exits(run_daily.check_data_freshness, "2026-05-01", "2026-06-10",
+                     "ibkr_paper", True)
+    check(blocked is False, "allow_stale=True lets stale paper run proceed")
+
+
+def test_unparseable_date_does_not_block():
+    print("\n[Z] an unparseable data date warns, does not crash/block")
+    blocked = _exits(run_daily.check_data_freshness, "not-a-date", "2026-06-10",
+                     "ibkr_paper", False)
+    check(blocked is False, "bad date string is handled gracefully")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -433,6 +488,11 @@ def main():
     test_time_safety_market_hours_during_rth_proceeds()
     test_time_safety_moo_during_rth_blocks()
     test_time_safety_overrides_proceed_outside_window()
+    test_fresh_data_passes()
+    test_stale_data_blocks_paper()
+    test_stale_data_warns_only_in_sim()
+    test_allow_stale_override()
+    test_unparseable_date_does_not_block()
 
     print("\n" + "=" * 60)
     print(f"  RESULTS: {_passed} passed, {_failed} failed")

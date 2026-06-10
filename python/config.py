@@ -106,3 +106,10 @@ FEE_CAP_PCT = 0.01
 
 MAX_PORTFOLIO_RISK_PCT = 0.02
 DRY_RUN = True
+
+# Maximum age (in CALENDAR days) of the latest price bar the pipeline trades on.
+# If the freshest bar is older than this, the daily price update likely failed
+# (yfinance down / network) and ibkr_paper submission is blocked. 4 days covers
+# a normal weekend plus one market holiday without false positives; raise it for
+# back-to-back holiday closures. Override a single run with --allow-stale-data.
+MAX_DATA_STALENESS_DAYS = 4

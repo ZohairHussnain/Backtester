@@ -42,6 +42,7 @@ from config import (
     state_file_for_mode,
     ORDERS_FILE, OUTPUT_DIR, STARTING_CAPITAL, IBKR_PAPER_STRATEGY_CAPITAL,
     THRESHOLD, SLIPPAGE, FEE_PER_SHARE, FEE_MIN, FEE_CAP_PCT,
+    MAX_DATA_STALENESS_DAYS,
 )
 from download_data import update_prices
 from feature_engine import get_latest_features, load_prices
@@ -384,7 +385,46 @@ def create_broker(mode: str):
 # Signal + order generation (shared)
 # ======================================================================
 
-def generate_signals_and_orders(portfolio: Portfolio, today: str):
+def check_data_freshness(latest_date: str, today: str, mode: str,
+                         allow_stale: bool = False) -> None:
+    """Guard against trading on stale prices.
+
+    The daily price update is best-effort (yfinance errors are swallowed and the
+    run continues on cached data), so a network/yfinance outage can silently
+    leave the latest bar days old. This checks the freshest bar the pipeline is
+    about to trade on and, for ibkr_paper, BLOCKS submission when it is older
+    than MAX_DATA_STALENESS_DAYS calendar days. Other modes warn only.
+    Pass --allow-stale-data to override the block deliberately.
+    """
+    try:
+        latest = datetime.strptime(str(latest_date)[:10], "%Y-%m-%d")
+        now = datetime.strptime(str(today)[:10], "%Y-%m-%d")
+    except (ValueError, TypeError):
+        print(f"  WARNING: Could not parse data date '{latest_date}' for staleness check.")
+        return
+
+    gap_days = (now - latest).days
+    if gap_days <= MAX_DATA_STALENESS_DAYS:
+        print(f"  Data freshness: latest bar {str(latest_date)[:10]} "
+              f"({gap_days}d old, threshold {MAX_DATA_STALENESS_DAYS}d). OK.")
+        return
+
+    bang = "!" * 56
+    print(f"  {bang}")
+    print(f"  WARNING: STALE DATA -- latest bar is {str(latest_date)[:10]}, "
+          f"{gap_days} days old (threshold {MAX_DATA_STALENESS_DAYS}d).")
+    print(f"  The daily price update likely failed (check yfinance / network).")
+    print(f"  {bang}")
+
+    if mode == "ibkr_paper" and not allow_stale:
+        log_run(mode, "BLOCKED", f"stale data: latest {str(latest_date)[:10]} ({gap_days}d)")
+        print(f"  BLOCKED: refusing to submit paper orders on stale data.")
+        print(f"  Fix the price data and re-run, or pass --allow-stale-data to override.")
+        sys.exit(1)
+
+
+def generate_signals_and_orders(portfolio: Portfolio, today: str,
+                                mode: str = "sim", allow_stale: bool = False):
     print("\n[1/7] Updating prices...")
     try:
         update_prices(UNIVERSE_FILE)
@@ -399,6 +439,9 @@ def generate_signals_and_orders(portfolio: Portfolio, today: str):
         print("ERROR: No features computed. Aborting.")
         sys.exit(1)
     print(f"  Features for {len(features)} tickers on {features['date'].iloc[0]}")
+
+    # Block trading on stale prices (ibkr_paper) / warn otherwise.
+    check_data_freshness(str(features["date"].max()), today, mode, allow_stale)
 
     print("\n[3/7] Generating predictions...")
     predictor = Predictor(MODELS_DIR)
@@ -431,7 +474,7 @@ def generate_signals_and_orders(portfolio: Portfolio, today: str):
 def run_sim(today: str):
     portfolio = Portfolio(state_file_for_mode("sim"), STARTING_CAPITAL)
     is_duplicate = check_duplicate(portfolio, today)
-    orders, predictions, _ = generate_signals_and_orders(portfolio, today)
+    orders, predictions, _ = generate_signals_and_orders(portfolio, today, "sim")
 
     print("\n[6/7] Executing (simulated fills)...")
     if not is_duplicate and not orders.empty:
@@ -521,9 +564,10 @@ def build_ibkr_order(order_row, today: str, order_type: str = "MOO"):
 # Mode: ibkr_dry_run
 # ======================================================================
 
-def run_ibkr_dry_run(today: str, order_type: str = "MOO"):
+def run_ibkr_dry_run(today: str, order_type: str = "MOO", allow_stale: bool = False):
     portfolio = Portfolio(state_file_for_mode("ibkr_dry_run"), IBKR_PAPER_STRATEGY_CAPITAL)
-    orders, predictions, _ = generate_signals_and_orders(portfolio, today)
+    orders, predictions, _ = generate_signals_and_orders(
+        portfolio, today, "ibkr_dry_run", allow_stale)
 
     print(f"\n[6/7] IBKR DRY RUN ({order_type}) -- NO ORDERS SUBMITTED...")
     broker = create_broker("ibkr_dry_run")
@@ -549,7 +593,7 @@ def run_ibkr_dry_run(today: str, order_type: str = "MOO"):
 # Mode: ibkr_paper
 # ======================================================================
 
-def run_ibkr_paper(today: str, order_type: str = "MOO"):
+def run_ibkr_paper(today: str, order_type: str = "MOO", allow_stale: bool = False):
     portfolio = Portfolio(state_file_for_mode("ibkr_paper"), IBKR_PAPER_STRATEGY_CAPITAL)
     is_duplicate = check_duplicate(portfolio, today)
 
@@ -558,7 +602,8 @@ def run_ibkr_paper(today: str, order_type: str = "MOO"):
         print("  Use --reconcile-only to fetch fills.")
         return
 
-    orders, predictions, _ = generate_signals_and_orders(portfolio, today)
+    orders, predictions, _ = generate_signals_and_orders(
+        portfolio, today, "ibkr_paper", allow_stale)
 
     if orders.empty:
         print("\n[6/7] No orders to submit.")
@@ -845,6 +890,9 @@ def parse_args():
                        help="Submit immediate MKT orders (TIF=DAY) for running during "
                             "regular trading hours (09:30-16:00 ET) instead of pre-market "
                             "MOO orders. Changes the allowed submission window to RTH.")
+    parser.add_argument("--allow-stale-data", action="store_true",
+                       help="Override the stale-price guard and submit paper orders even "
+                            "when the latest bar is older than MAX_DATA_STALENESS_DAYS.")
     parser.add_argument("--reconcile-only", action="store_true",
                        help="Fetch fills from IBKR, update portfolio, no new orders")
     parser.add_argument("--override-time-check", action="store_true",
@@ -907,9 +955,9 @@ def main():
         if args.mode == "sim":
             run_sim(today)
         elif args.mode == "ibkr_dry_run":
-            run_ibkr_dry_run(today, order_type)
+            run_ibkr_dry_run(today, order_type, args.allow_stale_data)
         elif args.mode == "ibkr_paper":
-            run_ibkr_paper(today, order_type)
+            run_ibkr_paper(today, order_type, args.allow_stale_data)
 
         log_run(args.mode, "COMPLETE", "success")
     except Exception as e:
