@@ -289,7 +289,10 @@ def print_order_summary(orders, portfolio: Portfolio, broker) -> None:
     print(f"  {'-'*58}")
 
     for _, o in orders.iterrows():
-        shares = o.get("shares", 0)
+        # Show the floored (integer) quantity that will actually be submitted.
+        shares = floor_shares_for_ibkr(o.get("shares", 0))
+        if shares < 1:
+            continue
         # Estimate value from latest close
         try:
             prices = load_prices(o["ticker"])
@@ -299,7 +302,7 @@ def print_order_summary(orders, portfolio: Portfolio, broker) -> None:
         est_val = shares * price
         total_value += est_val if o.get("action") == "BUY" else 0
 
-        print(f"  {o.get('action',''):<6} {o.get('ticker',''):<8} {shares:>8.2f} "
+        print(f"  {o.get('action',''):<6} {o.get('ticker',''):<8} {shares:>8d} "
               f"${est_val:>11,.2f} ${o.get('stop_price',0):>7.2f} "
               f"${o.get('target_price',0):>7.2f} {o.get('probability',0):>5.4f}")
 
@@ -432,6 +435,45 @@ def _apply_sim_orders(orders, portfolio: Portfolio, today: str) -> None:
 
 
 # ======================================================================
+# IBKR integer-share enforcement
+# ======================================================================
+
+def floor_shares_for_ibkr(shares) -> int:
+    """Floor a (possibly fractional) share quantity to whole shares.
+
+    IBKR does not accept fractional share orders, so every IBKR-bound order
+    must be a whole number. Floor rounding only; never rounds up.
+    """
+    import math
+    try:
+        return int(math.floor(float(shares)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def build_ibkr_order(order_row, today: str):
+    """Build an integer-share Order for IBKR, or None if it should be skipped.
+
+    Shares are floored to whole units. Orders that floor to < 1 share return
+    None so the caller can skip and log them. This is the single place where
+    IBKR-bound order quantities are made integer — both dry-run and paper go
+    through here, so the lifecycle log, summary, and submission all agree.
+    """
+    shares = floor_shares_for_ibkr(order_row["shares"])
+    if shares < 1:
+        return None
+    action = Action.BUY if order_row["action"] == "BUY" else Action.SELL
+    return Order.create(
+        date=today, ticker=order_row["ticker"], action=action,
+        shares=shares,
+        stop_price=order_row.get("stop_price", 0),
+        target_price=order_row.get("target_price", 0),
+        reason=order_row.get("reason", ""),
+        probability=order_row.get("probability", 0),
+    )
+
+
+# ======================================================================
 # Mode: ibkr_dry_run
 # ======================================================================
 
@@ -443,15 +485,11 @@ def run_ibkr_dry_run(today: str):
     broker = create_broker("ibkr_dry_run")
 
     for _, order_row in orders.iterrows():
-        action = Action.BUY if order_row["action"] == "BUY" else Action.SELL
-        order = Order.create(
-            date=today, ticker=order_row["ticker"], action=action,
-            shares=order_row["shares"],
-            stop_price=order_row.get("stop_price", 0),
-            target_price=order_row.get("target_price", 0),
-            reason=order_row.get("reason", ""),
-            probability=order_row.get("probability", 0),
-        )
+        order = build_ibkr_order(order_row, today)
+        if order is None:
+            print(f"    DRY RUN skip {order_row['ticker']}: "
+                  f"{order_row['shares']} shares floors to < 1")
+            continue
         try:
             broker.submit_order(order)
         except Exception as e:
@@ -505,15 +543,11 @@ def run_ibkr_paper(today: str):
 
     submitted_orders = []
     for _, order_row in orders.iterrows():
-        action = Action.BUY if order_row["action"] == "BUY" else Action.SELL
-        order = Order.create(
-            date=today, ticker=order_row["ticker"], action=action,
-            shares=order_row["shares"],
-            stop_price=order_row.get("stop_price", 0),
-            target_price=order_row.get("target_price", 0),
-            reason=order_row.get("reason", ""),
-            probability=order_row.get("probability", 0),
-        )
+        order = build_ibkr_order(order_row, today)
+        if order is None:
+            print(f"    SKIP {order_row['ticker']}: "
+                  f"{order_row['shares']} shares floors to < 1")
+            continue
 
         # Duplicate checks
         if _has_pending_order(order.ticker, today):
