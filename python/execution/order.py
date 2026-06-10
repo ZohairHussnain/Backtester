@@ -41,6 +41,7 @@ class Order:
     fill_price: Optional[float] = None
     fill_shares: Optional[float] = None
     broker_order_id: Optional[str] = None
+    perm_id: Optional[str] = None
     entry_fee: float = 0.0
 
     @staticmethod
@@ -66,7 +67,8 @@ class Order:
             "rank": self.rank, "created_at": self.created_at,
             "submitted_at": self.submitted_at, "filled_at": self.filled_at,
             "fill_price": self.fill_price, "fill_shares": self.fill_shares,
-            "broker_order_id": self.broker_order_id, "entry_fee": self.entry_fee,
+            "broker_order_id": self.broker_order_id, "perm_id": self.perm_id,
+            "entry_fee": self.entry_fee,
         }
 
 

@@ -189,13 +189,18 @@ class IBKRBroker(BrokerAdapter):
             self.ib.sleep(1)  # wait for acknowledgment
 
             broker_id = str(trade.order.orderId)
+            # permId is the STABLE cross-session id IBKR assigns once the order
+            # is acknowledged. orderId can come back as 0 for fills queried in a
+            # later API session, so permId is what reconciliation matches on.
+            perm_id = str(trade.order.permId) if trade.order.permId else ""
             order.status = OrderStatus.SUBMITTED
             order.submitted_at = datetime.now().isoformat()
             order.broker_order_id = broker_id
+            order.perm_id = perm_id
 
             status = trade.orderStatus.status
             self._log_order(order, status, broker_id,
-                          f"Submitted {side} {shares} {order.ticker} MOO")
+                          f"Submitted {side} {shares} {order.ticker} MOO permId={perm_id}")
             print(f"    SUBMITTED: {side} {shares} {order.ticker} MOO -> orderId={broker_id} ({status})")
             return broker_id
 
@@ -259,6 +264,21 @@ class IBKRBroker(BrokerAdapter):
     # Fills
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalize_side(side: str) -> str:
+        """Map IBKR execution side codes to our Action values.
+
+        IBKR reports executions as 'BOT' (bought) / 'SLD' (sold), not
+        'BUY'/'SELL'. Reconciliation builds Action(...) from this, so it must
+        be normalized or Action('BOT') would raise.
+        """
+        s = (side or "").upper()
+        if s in ("BOT", "BUY"):
+            return "BUY"
+        if s in ("SLD", "SELL"):
+            return "SELL"
+        return s
+
     def get_fills(self, since: Optional[str] = None) -> list[dict]:
         self._ensure_connected()
         result = []
@@ -266,13 +286,16 @@ class IBKRBroker(BrokerAdapter):
             filled_at = fill.time.isoformat() if fill.time else ""
             if since and filled_at < since:
                 continue
+            execu = fill.execution
             result.append({
-                "fill_id": str(fill.execution.execId),
-                "order_id": str(fill.execution.orderId),
+                "fill_id": str(execu.execId),
+                # permId is stable across API sessions; orderId may be 0 here.
+                "perm_id": str(execu.permId) if getattr(execu, "permId", 0) else "",
+                "order_id": str(execu.orderId),
                 "ticker": fill.contract.symbol,
-                "action": fill.execution.side,
-                "shares_filled": fill.execution.shares,
-                "fill_price": fill.execution.price,
+                "action": self._normalize_side(execu.side),
+                "shares_filled": execu.shares,
+                "fill_price": execu.price,
                 "commission": fill.commissionReport.commission if fill.commissionReport else 0,
                 "filled_at": filled_at,
             })

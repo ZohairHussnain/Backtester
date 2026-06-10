@@ -579,18 +579,15 @@ def run_ibkr_paper(today: str):
     # Check for immediate fills
     print("\n  Checking for immediate fills...")
     broker_fills = broker.get_fills()
+    applied = []
     if broker_fills:
         fills = reconciler.reconcile(broker_fills, submitted_orders)
         for fill in fills:
             try:
-                if fill.action == Action.BUY:
-                    portfolio.record_entry(
-                        fill.ticker, fill.shares_filled, fill.fill_price,
-                        0, 0, today, fill.commission)
-                else:
-                    portfolio.record_exit(fill.ticker, fill.fill_price, today, "ibkr_fill")
-                print(f"    FILLED: {fill.action.value} {fill.shares_filled:.0f} "
-                      f"{fill.ticker} @ ${fill.fill_price:.2f}")
+                if apply_fill(portfolio, fill, today):
+                    applied.append(fill)
+                    print(f"    FILLED: {fill.action.value} {fill.shares_filled:.0f} "
+                          f"{fill.ticker} @ ${fill.fill_price:.2f}")
             except Exception as e:
                 print(f"    FILL ERROR {fill.ticker}: {e}")
     else:
@@ -598,7 +595,10 @@ def run_ibkr_paper(today: str):
         print("  Run --reconcile-only after market open to fetch fills.")
 
     broker.disconnect()
+    # Save state (commits processed_fill_ids atomically) BEFORE writing the
+    # fills audit log, so a crash can never leave an audited-but-unapplied fill.
     _save_and_report(portfolio, orders, predictions, today)
+    reconciler.log_fills(applied)
 
 
 # ======================================================================
@@ -627,35 +627,27 @@ def run_reconcile_only(today: str):
     print(f"  Found {len(broker_fills)} fills.")
 
     lifecycle_path = OUTPUT_DIR / "orders_lifecycle.csv"
-    pending_orders = []
-    if lifecycle_path.exists():
-        import pandas as pd
-        df = pd.read_csv(lifecycle_path)
-        for _, row in df[df["status"].isin(["SUBMITTED", "PENDING"])].iterrows():
-            pending_orders.append(Order(
-                order_id=row["order_id"], date=row["date"], ticker=row["ticker"],
-                action=Action(row["action"]), shares=row["shares"],
-                order_type=row.get("order_type", "MOO"),
-                stop_price=row.get("stop_price", 0),
-                target_price=row.get("target_price", 0),
-                status=OrderStatus(row["status"]), reason=row.get("reason", ""),
-            ))
+    pending_orders = load_pending_orders_from_lifecycle(lifecycle_path)
 
     fills = reconciler.reconcile(broker_fills, pending_orders)
+    applied = []
     for fill in fills:
         try:
-            if fill.action == Action.BUY:
-                portfolio.record_entry(
-                    fill.ticker, fill.shares_filled, fill.fill_price,
-                    0, 0, today, fill.commission)
+            if apply_fill(portfolio, fill, today):
+                applied.append(fill)
+                print(f"    RECONCILED: {fill.action.value} {fill.shares_filled:.0f} "
+                      f"{fill.ticker} @ ${fill.fill_price:.2f}")
             else:
-                portfolio.record_exit(fill.ticker, fill.fill_price, today, "ibkr_fill")
-            print(f"    RECONCILED: {fill.action.value} {fill.shares_filled:.0f} "
-                  f"{fill.ticker} @ ${fill.fill_price:.2f}")
+                print(f"    SKIP {fill.ticker}: fill {fill.fill_id} already applied")
         except Exception as e:
             print(f"    RECONCILE ERROR {fill.ticker}: {e}")
 
+    if not applied:
+        print("  No NEW fills to apply (all already reconciled).")
+
+    # Save state (commits processed_fill_ids atomically) BEFORE the audit log.
     portfolio.save()
+    reconciler.log_fills(applied)
     broker.disconnect()
     print(f"  Portfolio updated. Cash: ${portfolio.cash:,.2f}")
 
@@ -663,6 +655,59 @@ def run_reconcile_only(today: str):
 # ======================================================================
 # Helpers
 # ======================================================================
+
+def apply_fill(portfolio: Portfolio, fill, today: str) -> bool:
+    """Apply a confirmed broker fill to the strategy ledger.
+
+    Returns True if the fill was applied, False if it was already processed
+    (idempotent skip). Uses the EXACT broker fill price and commission (no
+    simulated slippage/fee) and supports partial fills. The fill id is marked
+    processed in the same Portfolio state that records the fill's effect, so the
+    mark and the effect are committed together on the next atomic save().
+    """
+    if portfolio.is_fill_processed(fill.fill_id):
+        return False
+    fill_date = fill.filled_at[:10] if fill.filled_at else today
+    if fill.action == Action.BUY:
+        portfolio.apply_buy_fill(
+            fill.ticker, fill.shares_filled, fill.fill_price,
+            fill.commission, fill_date)
+    else:
+        portfolio.apply_sell_fill(
+            fill.ticker, fill.shares_filled, fill.fill_price,
+            fill.commission, fill_date, "ibkr_fill")
+    portfolio.mark_fill_processed(fill.fill_id)
+    return True
+
+
+def load_pending_orders_from_lifecycle(lifecycle_path: Path) -> list:
+    """Rebuild pending Order objects from orders_lifecycle.csv, INCLUDING the
+    broker_order_id / perm_id bridge fields needed to match IBKR fills.
+    """
+    pending = []
+    if not lifecycle_path.exists():
+        return pending
+    import pandas as pd
+    df = pd.read_csv(lifecycle_path)
+    open_statuses = ["SUBMITTED", "PENDING", "PARTIALLY_FILLED"]
+    for _, row in df[df["status"].isin(open_statuses)].iterrows():
+        def _opt(col):
+            val = row.get(col)
+            if val is None or (isinstance(val, float) and val != val):  # NaN
+                return None
+            return str(val)
+        pending.append(Order(
+            order_id=row["order_id"], date=row["date"], ticker=row["ticker"],
+            action=Action(row["action"]), shares=row["shares"],
+            order_type=row.get("order_type", "MOO"),
+            stop_price=row.get("stop_price", 0),
+            target_price=row.get("target_price", 0),
+            status=OrderStatus(row["status"]), reason=row.get("reason", ""),
+            broker_order_id=_opt("broker_order_id"),
+            perm_id=_opt("perm_id"),
+        ))
+    return pending
+
 
 def check_duplicate(portfolio: Portfolio, today: str) -> bool:
     last = portfolio.get_state().get("last_updated", "")
