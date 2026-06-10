@@ -287,7 +287,7 @@ All under `output/`:
 ## Troubleshooting
 
 - **`No features computed. Aborting.`** — price data is missing or stale; run `python download_data.py` (need ≥200 bars per ticker).
-- **`BLOCKED: refusing to submit paper orders on stale data`** — the latest bar is older than `MAX_DATA_STALENESS_DAYS`; the daily yfinance update likely failed. Re-run `python download_data.py` and confirm fresh bars, then retry. Only if you understand the staleness (e.g. an extended exchange holiday) pass `--allow-stale-data` to override.
+- **`BLOCKED: refusing to submit paper orders on stale data`** — the latest bar is older than `MAX_DATA_STALENESS_TRADING_DAYS` NYSE sessions; the daily yfinance update likely failed. Re-run `python download_data.py` and confirm fresh bars, then retry. Only if you understand the staleness (e.g. an extended exchange holiday) pass `--allow-stale-data` to override.
 - **`No model found` / predictor load error** — run `walk_forward_train.py`; confirm `python/models/` has `.joblib` files.
 - **`Connection refused` to IBKR** — Gateway not running, not logged in, or API/port 4002 not enabled. Re-run `test_ibkr_connection.py`.
 - **Pre-flight blocked (paper)** — broker equity *below* local, buying power below intended notional, or a *local* position missing at the broker. Run `python run_daily.py --reconcile-only` to sync, then re-submit. (A large broker surplus and unrelated broker-only holdings are expected and do **not** block.)
