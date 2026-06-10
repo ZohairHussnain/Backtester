@@ -46,6 +46,10 @@ python run_daily.py --mode ibkr_paper --confirm-paper-orders  # submit pre-marke
 python run_daily.py --mode ibkr_paper --confirm-paper-orders --market-hours  # immediate MKT during RTH
 python run_daily.py --reconcile-only                          # fetch fills, update state (idempotent)
 
+# Sync machines on one paper account (read-only pull; --apply rebuilds local paper ledger)
+python ibkr_sync.py                                           # print broker state + diff vs local
+python ibkr_sync.py --apply --confirm                         # rebuild portfolio_state.paper.json from broker
+
 # Data
 python download_data.py           # default tickers / incremental refresh
 python expand_universe.py         # full 101-stock universe
@@ -56,6 +60,7 @@ python test_ibkr_connection.py
 # Python test suites (zero-dependency assert harness, temp files only)
 python test_state_isolation.py    # sim/paper state isolation, migration, reset
 python test_ibkr_execution.py     # preflight, integer shares, reconciliation, stale-price guard
+python test_ibkr_sync.py          # broker-truth snapshot, position diff, paper-ledger rebuild
 ```
 
 There is no pytest setup. Tests are plain scripts with a `check(cond, msg)` harness that exits non-zero on any failure. Run them directly. Match this style when adding tests.
@@ -77,6 +82,7 @@ There is no pytest setup. Tests are plain scripts with a `check(cond, msg)` harn
 
 - `config.py` — **all** thresholds, risk limits, model choice, paths, and IBKR settings. Change behavior here, not by editing modules.
 - `run_daily.py` — the daily orchestrator (modes: `sim`, `ibkr_dry_run`, `ibkr_paper`, plus `--reconcile-only`).
+- `ibkr_sync.py` — read-only pull of live broker state (open orders/positions/account/fills) to sync machines sharing one paper account; `--apply --confirm` rebuilds `portfolio_state.paper.json` from broker truth. Never submits orders.
 - `feature_engine.py`, `predictor.py`, `order_generator.py`, `portfolio.py`, `reporter.py`, `download_data.py`.
 - `execution/`:
   - `order.py` — `Order`, `Fill`, `OrderStatus`, `Action` (orders carry `broker_order_id` + `perm_id`)

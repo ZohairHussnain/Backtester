@@ -215,6 +215,34 @@ Reconciliation is **idempotent and crash-safe**: each applied execution id is re
 
 ---
 
+## 9b. Syncing two machines on the same paper account
+
+If you run the strategy from more than one computer against the **same IBKR paper account**, each machine keeps its own local ledger (`portfolio_state.paper.json`) and per-machine logs (`orders_lifecycle.csv`, `fills.csv`). When laptop A submits and fills, laptop B's local ledger knows nothing about it.
+
+**`--reconcile-only` does not fix this**: it matches broker fills against the *local* `orders_lifecycle.csv` (by `perm_id`/`broker_order_id`). Laptop B never recorded laptop A's orders, so those fills are "unmatched" and skipped. The IBKR account itself is the shared source of truth.
+
+`ibkr_sync.py` pulls that truth and can rebuild a machine's local paper ledger from it. The connection is **read-only** (`IBKRBroker(dry_run=True)` opens a read-only API session on the hardcoded paper port); it can never place or cancel an order.
+
+```powershell
+cd python
+
+# Read-only: print broker open orders / positions / account / recent fills,
+# write output/ibkr_snapshot.json, and show how local paper state differs.
+python ibkr_sync.py
+
+# Machine-readable snapshot only (still writes the file).
+python ibkr_sync.py --json
+
+# Rebuild THIS machine's paper positions from the broker. Requires --confirm.
+python ibkr_sync.py --apply --confirm
+```
+
+`--apply` sets `open_positions` to the broker's actual STK holdings (shares + average cost), preserving each ticker's local `stop_price`/`target_price`/`entry_date` where it already exists locally. Cash is reconstructed from the strategy capital envelope (`IBKR_PAPER_STRATEGY_CAPITAL` + local realized P&L − open cost basis), **not** read from the auto-funded ~$1M paper balance. It writes only `portfolio_state.paper.json` (atomic, backed up) and never touches sim state.
+
+Caveats: the broker does not report stop/target or original entry date, so **broker-only** positions (opened on another machine) come back with today's date and zero stop/target — review them before the next run if exit logic matters. Realized-P&L history still lives per machine, so for fully consistent cash, prefer running `--reconcile-only` on the machine that *submitted* the orders and `ibkr_sync.py --apply --confirm` on the other.
+
+---
+
 ## 9a. IBKR paper verification checklist (run once, in order)
 
 A safe, ordered pass to confirm the paper integration end-to-end. Stop at the first step that misbehaves.
@@ -283,6 +311,7 @@ All under `output/`:
 | `orders_lifecycle.csv` | `run_daily.py` (OrderManager) | submitted-order lifecycle log; includes `broker_order_id` + `perm_id` |
 | `fills.csv` | FillReconciler | confirmed fills (audit log; written after state is saved) |
 | `ibkr_order_log.csv` | IBKRBroker | every IBKR submit/dry-run/reject |
+| `ibkr_snapshot.json` | `ibkr_sync.py` | last pulled broker state (open orders, positions, account, recent fills) for syncing machines |
 | `portfolio_state.paper.json` (+`.bak`) | Portfolio | paper/dry-run ledger: cash, positions, trade history, `processed_fill_ids` |
 | `portfolio_state.sim.json` (+`.bak`) | Portfolio | sim-mode ledger (isolated from paper) |
 | `daily_report.html` | Reporter | human-readable daily report |

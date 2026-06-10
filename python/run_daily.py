@@ -165,6 +165,19 @@ def check_time_safety(args) -> None:
 # Pre-flight sanity checks (ibkr_paper only)
 # ======================================================================
 
+def _latest_close(ticker: str) -> float:
+    """Latest close for a ticker, or 0.0 if unavailable.
+
+    Single price-lookup seam: every place that needs a current price routes
+    through here so behavior (and tests) have one point to stub.
+    """
+    try:
+        prices = load_prices(ticker)
+        return float(prices.iloc[-1]["close"])
+    except Exception:
+        return 0.0
+
+
 def intended_buy_notional(orders) -> float:
     """Estimate total cash needed for today's BUY orders from latest closes.
 
@@ -181,12 +194,7 @@ def intended_buy_notional(orders) -> float:
         shares = math.floor(o.get("shares", 0))
         if shares < 1:
             continue
-        try:
-            prices = load_prices(o["ticker"])
-            price = prices.iloc[-1]["close"]
-        except Exception:
-            price = 0
-        total += shares * price
+        total += shares * _latest_close(o["ticker"])
     return total
 
 
@@ -335,12 +343,7 @@ def print_order_summary(orders, portfolio: Portfolio, broker) -> None:
         if shares < 1:
             continue
         # Estimate value from latest close
-        try:
-            prices = load_prices(o["ticker"])
-            price = prices.iloc[-1]["close"]
-        except Exception:
-            price = 0
-        est_val = shares * price
+        est_val = shares * _latest_close(o["ticker"])
         total_value += est_val if o.get("action") == "BUY" else 0
 
         print(f"  {o.get('action',''):<6} {o.get('ticker',''):<8} {shares:>8d} "
