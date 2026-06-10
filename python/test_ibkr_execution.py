@@ -430,6 +430,17 @@ def test_trading_day_counting():
     check(run_daily.trading_days_between("bad", "2026-06-10") == -1, "unparseable -> -1")
 
 
+def test_holiday_aware_counting():
+    print("\n[V0b] NYSE holidays are excluded from session counting")
+    # Thanksgiving 2025-11-27 (Thu) is an NYSE holiday; Wed 26 and Fri 28 trade.
+    # Weekday-only counting would give 2 (Thu+Fri); holiday-aware gives 1.
+    check(run_daily.trading_days_between("2025-11-26", "2025-11-28") == 1,
+          "Thanksgiving Thu excluded: Wed->Fri = 1 session")
+    # Christmas 2025-12-25 (Thu) holiday; Wed 24 (half day) and Fri 26 trade.
+    check(run_daily.trading_days_between("2025-12-24", "2025-12-26") == 1,
+          "Christmas Thu excluded: Wed->Fri = 1 session")
+
+
 def test_fresh_data_passes():
     print("\n[V] fresh data passes the staleness guard")
     blocked = _exits(run_daily.check_data_freshness, "2026-06-09", "2026-06-10",
@@ -506,6 +517,7 @@ def main():
     test_time_safety_moo_during_rth_blocks()
     test_time_safety_overrides_proceed_outside_window()
     test_trading_day_counting()
+    test_holiday_aware_counting()
     test_fresh_data_passes()
     test_weekend_gap_not_stale()
     test_stale_data_blocks_paper()

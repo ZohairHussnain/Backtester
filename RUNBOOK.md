@@ -52,7 +52,7 @@ cd python
 pip install -r requirements.txt
 ```
 
-This installs pandas, numpy, scikit-learn, xgboost, lightgbm, joblib, yfinance, and ib_insync.
+This installs pandas, numpy, scikit-learn, xgboost, lightgbm, joblib, yfinance, ib_insync, and pandas_market_calendars (NYSE calendar for the stale-price guard).
 
 All thresholds, risk limits, model choice, and paths live in `python/config.py`. The defaults are pre-committed (threshold 0.60, $10,000 starting capital). You normally do **not** edit this. For IBKR paper, `IBKR_PAPER_STRATEGY_CAPITAL` (default `$10,000`) is the capital the strategy sizes off — the strategy runs as a sub-allocation inside the larger IBKR paper account, so this is intentionally **not** the broker's total balance.
 
@@ -187,7 +187,7 @@ Guardrails enforced, in order:
   - **Buying-power sufficiency** — broker buying power must cover the intended BUY notional.
   - **Position check** — every *local* position must be backed at the broker (hard block); unrelated *broker-only* holdings are warnings, not blockers.
   - Logs broker equity / buying power / cash, local equity / cash, configured capital, and intended order notional.
-- **Stale-price guard** — the daily price update is best-effort (yfinance errors are swallowed and the run continues on cached data). Staleness is measured in **NYSE trading sessions** (weekend-aware; holiday-aware too if `pandas_market_calendars` is installed, weekday-only otherwise). If the freshest bar is older than `MAX_DATA_STALENESS_TRADING_DAYS` (default 3 sessions), `ibkr_paper` submission is **blocked** so you never trade on stale prices after a failed update. A Friday bar read on Monday counts as 1 session, so normal weekends never trip it. Override a single run with `--allow-stale-data`. Other modes warn only.
+- **Stale-price guard** — the daily price update is best-effort (yfinance errors are swallowed and the run continues on cached data). Staleness is measured in **NYSE trading sessions** (weekend- and holiday-aware via `pandas_market_calendars`, included in requirements; falls back to weekday-only if that package is ever absent). If the freshest bar is older than `MAX_DATA_STALENESS_TRADING_DAYS` (default 3 sessions), `ibkr_paper` submission is **blocked** so you never trade on stale prices after a failed update. A Friday bar read on Monday counts as 1 session, so normal weekends never trip it. Override a single run with `--allow-stale-data`. Other modes warn only.
 - **Integer shares** — all IBKR-bound orders are floored to whole shares (IBKR rejects fractional); orders that floor to < 1 share are skipped.
 - Per-ticker duplicate checks against `output/orders_lifecycle.csv` and live IBKR open orders.
 - No shorting: SELL only for tickers you actually hold; BUY skipped if already holding.
