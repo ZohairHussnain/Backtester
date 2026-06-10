@@ -54,7 +54,7 @@ pip install -r requirements.txt
 
 This installs pandas, numpy, scikit-learn, xgboost, lightgbm, joblib, yfinance, and ib_insync.
 
-All thresholds, risk limits, model choice, and paths live in `python/config.py`. The defaults are pre-committed (threshold 0.60, top-N 2, max 2 positions, $10,000 starting capital). You normally do **not** edit this.
+All thresholds, risk limits, model choice, and paths live in `python/config.py`. The defaults are pre-committed (threshold 0.60, $10,000 starting capital). You normally do **not** edit this. For IBKR paper, `IBKR_PAPER_STRATEGY_CAPITAL` (default `$10,000`) is the capital the strategy sizes off — the strategy runs as a sub-allocation inside the larger IBKR paper account, so this is intentionally **not** the broker's total balance.
 
 ---
 
@@ -174,11 +174,16 @@ python run_daily.py --mode ibkr_paper --confirm-paper-orders
 Guardrails enforced, in order:
 - `--confirm-paper-orders` is **required**; without it the run aborts.
 - Hard-blocked outside **04:00–09:25 ET** unless you pass *both* `--override-time-check` and `--i-understand-time-risk`.
-- **Pre-flight checks** compare local vs broker equity (10% tolerance) and positions; any mismatch blocks submission until you reconcile.
+- **Pre-flight checks** (sub-allocation aware — the strategy runs as a `$IBKR_PAPER_STRATEGY_CAPITAL` envelope inside a much larger paper account):
+  - Equity guard is **one-sided** — broker equity must be **≥** local strategy equity. A large broker surplus is expected and fine; broker *below* local signals stale/corrupt local state and blocks.
+  - **Buying-power sufficiency** — broker buying power must cover the intended BUY notional.
+  - **Position check** — every *local* position must be backed at the broker (hard block); unrelated *broker-only* holdings are warnings, not blockers.
+  - Logs broker equity / buying power / cash, local equity / cash, configured capital, and intended order notional.
+- **Integer shares** — all IBKR-bound orders are floored to whole shares (IBKR rejects fractional); orders that floor to < 1 share are skipped.
 - Per-ticker duplicate checks against `output/orders_lifecycle.csv` and live IBKR open orders.
 - No shorting: SELL only for tickers you actually hold; BUY skipped if already holding.
 
-Submitted orders are logged to `output/orders_lifecycle.csv` and `output/ibkr_order_log.csv`. MOO orders fill at the open, so the run usually reports no immediate fills.
+Submitted orders are logged to `output/orders_lifecycle.csv` (now including `broker_order_id` and `perm_id`) and `output/ibkr_order_log.csv`. MOO orders fill at the open, so the run usually reports no immediate fills.
 
 ### After market open: reconcile fills
 
@@ -187,7 +192,51 @@ cd python
 python run_daily.py --reconcile-only
 ```
 
-Fetches fills from IBKR, matches them to submitted orders via the FillReconciler, and updates `portfolio_state.json`. **Portfolio state is only ever mutated from confirmed fills** — never from orders or signals. Run this after the open each day you submitted orders.
+Fetches fills from IBKR and matches them to submitted orders via the FillReconciler — on **`perm_id`** (IBKR's stable cross-session id), falling back to `broker_order_id` then a unique ticker+action match. Fills are applied to `portfolio_state.paper.json` at the **exact broker fill price and commission** (no simulated slippage/fee), with partial fills accumulated. **Portfolio state is only ever mutated from confirmed fills** — never from orders or signals.
+
+Reconciliation is **idempotent and crash-safe**: each applied execution id is recorded inside the portfolio state (`processed_fill_ids`) and committed atomically with cash/positions, and `fills.csv` is written only *after* that save. Re-running `--reconcile-only` (or re-running after a crash mid-reconcile) never double-counts a fill. Run it after the open each day you submitted orders.
+
+---
+
+## 9a. IBKR paper verification checklist (run once, in order)
+
+A safe, ordered pass to confirm the paper integration end-to-end. Stop at the first step that misbehaves.
+
+```powershell
+cd python
+
+# 1. Read-only connectivity. Places NO orders. Account must start with DU/DF.
+python test_ibkr_connection.py
+
+# 2. Full flow, connects to IBKR, logs intended orders, submits NOTHING.
+#    Paper state is NOT mutated.
+python run_daily.py --mode ibkr_dry_run
+
+# 3. Submit MOO orders to paper (pre-market 04:00-09:25 ET).
+#    Requires the confirmation flag.
+python run_daily.py --mode ibkr_paper --confirm-paper-orders
+
+# 4. After the market opens, fetch fills and update the paper ledger.
+#    Safe to re-run: idempotent.
+python run_daily.py --reconcile-only
+```
+
+**What to inspect after each step** (all under `output/`):
+
+| After | File | Look for |
+|-------|------|----------|
+| 2 (dry run) | `orders.csv` | today's generated orders (sizing/ranking). Fractional `shares` here is fine — they are floored for IBKR downstream. |
+| 2 (dry run) | `ibkr_order_log.csv` | one `DRY_RUN` row per order with **whole-share** quantities; any `REJECTED` rows (e.g. shares floored to < 1). |
+| 2 (dry run) | `portfolio_state.paper.json` | **unchanged** — dry run must not mutate it. |
+| 3 (paper) | console | the pre-flight block: broker equity ≫ local, buying power ≥ intended notional, "Positions backed at broker", "OK" lines. |
+| 3 (paper) | `orders_lifecycle.csv` | one row per submitted order with `status=SUBMITTED`, a non-empty **`broker_order_id`** and **`perm_id`**, integer `shares`. |
+| 3 (paper) | `ibkr_order_log.csv` | matching `Submitted ... MOO permId=...` rows. |
+| 3 (paper) | `daily_report.html` | the order summary matches what was submitted (integer shares). |
+| 4 (reconcile) | console | `RECONCILED:` lines for each fill; on a second run, `No NEW fills to apply (all already reconciled).` |
+| 4 (reconcile) | `fills.csv` | one row per execution (`fill_id`/execId, `perm_id`, price, commission); no duplicate `fill_id`s after re-running. |
+| 4 (reconcile) | `portfolio_state.paper.json` | cash debited/credited at the **actual** fill price; BUY positions added, SELL positions reduced/removed; `processed_fill_ids` populated. Re-running step 4 leaves cash and positions **identical**. |
+
+> Idempotency check: run step 4 twice. The second run must report no new fills and leave `portfolio_state.paper.json` byte-for-byte equivalent in cash/positions. If a fill ever appears twice in `fills.csv` *and* moves cash twice, stop and investigate.
 
 ---
 
@@ -214,10 +263,11 @@ All under `output/`:
 | `predictions.csv` / `predictions_all.csv` | `walk_forward_train.py` | model predictions |
 | `ml_metrics.csv` | `walk_forward_train.py` | per-fold evaluation metrics |
 | `orders.csv` | `run_daily.py` (order generator) | today's generated orders |
-| `orders_lifecycle.csv` | `run_daily.py` (OrderManager) | submitted-order lifecycle log |
-| `fills.csv` | FillReconciler | confirmed fills |
+| `orders_lifecycle.csv` | `run_daily.py` (OrderManager) | submitted-order lifecycle log; includes `broker_order_id` + `perm_id` |
+| `fills.csv` | FillReconciler | confirmed fills (audit log; written after state is saved) |
 | `ibkr_order_log.csv` | IBKRBroker | every IBKR submit/dry-run/reject |
-| `portfolio_state.json` (+`.bak`) | Portfolio / PortfolioManager | cash, positions, trade history |
+| `portfolio_state.paper.json` (+`.bak`) | Portfolio | paper/dry-run ledger: cash, positions, trade history, `processed_fill_ids` |
+| `portfolio_state.sim.json` (+`.bak`) | Portfolio | sim-mode ledger (isolated from paper) |
 | `daily_report.html` | Reporter | human-readable daily report |
 | `run_log.csv` | `run_daily.py` | one row per pipeline run |
 
@@ -230,7 +280,7 @@ All under `output/`:
 - **`No features computed. Aborting.`** — price data is missing or stale; run `python download_data.py` (need ≥200 bars per ticker).
 - **`No model found` / predictor load error** — run `walk_forward_train.py`; confirm `python/models/` has `.joblib` files.
 - **`Connection refused` to IBKR** — Gateway not running, not logged in, or API/port 4002 not enabled. Re-run `test_ibkr_connection.py`.
-- **Pre-flight equity/position mismatch (paper)** — run `python run_daily.py --reconcile-only` to sync, then re-submit.
+- **Pre-flight blocked (paper)** — broker equity *below* local, buying power below intended notional, or a *local* position missing at the broker. Run `python run_daily.py --reconcile-only` to sync, then re-submit. (A large broker surplus and unrelated broker-only holdings are expected and do **not** block.)
 - **`Pipeline already ran today`** — duplicate-run guard; use `--reconcile-only` to fetch fills without regenerating orders.
 - **Blocked outside MOO window** — submit between 04:00–09:25 ET, or (rarely) pass both override flags deliberately.
 
