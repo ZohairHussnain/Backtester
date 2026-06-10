@@ -78,6 +78,13 @@ THRESHOLD = 0.60
 TOP_N = 5
 MAX_POSITIONS = 10
 STARTING_CAPITAL = 10000.0
+
+# IBKR paper trading runs the strategy as a SUB-ALLOCATION inside a much larger
+# IBKR paper account (auto-funded at ~$1M+). The strategy must size off this
+# capital, NOT the full broker balance. Local portfolio_state.paper.json is the
+# strategy's own cash-envelope ledger; broker NetLiquidation includes unrelated
+# funds. Pre-flight therefore does NOT require broker == local equity.
+IBKR_PAPER_STRATEGY_CAPITAL = 10000.0
 RISK_PER_TRADE = 0.004      # position size = equity * (RISK_PER_TRADE / STOP_LOSS_PCT) = ~8% of equity
 MAX_POSITION_FRAC = 0.30    # per-order cash cap; loose enough to fill the 10th position as cash depletes
 STOP_LOSS_PCT = 0.05
