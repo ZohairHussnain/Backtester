@@ -626,14 +626,20 @@ def run_ibkr_dry_run(today: str, order_type: str = "MOO", allow_stale: bool = Fa
 # Mode: ibkr_paper
 # ======================================================================
 
-def run_ibkr_paper(today: str, order_type: str = "MOO", allow_stale: bool = False):
+def run_ibkr_paper(today: str, order_type: str = "MOO", allow_stale: bool = False,
+                   force_resubmit: bool = False):
     portfolio = Portfolio(state_file_for_mode("ibkr_paper"), IBKR_PAPER_STRATEGY_CAPITAL)
     is_duplicate = check_duplicate(portfolio, today)
 
-    if is_duplicate:
+    if is_duplicate and not force_resubmit:
         print("  Duplicate run detected. Skipping order generation.")
-        print("  Use --reconcile-only to fetch fills.")
+        print("  Use --reconcile-only to fetch fills, or --force-resubmit to submit")
+        print("  again (e.g. after manually cancelling at the broker). Live broker")
+        print("  open-order/holding checks prevent duplicate orders.")
         return
+    if is_duplicate and force_resubmit:
+        print("  Duplicate run, but --force-resubmit set: proceeding.")
+        print("  Live broker checks will skip any ticker already working or held.")
 
     orders, predictions, _ = generate_signals_and_orders(
         portfolio, today, "ibkr_paper", allow_stale)
@@ -663,6 +669,15 @@ def run_ibkr_paper(today: str, order_type: str = "MOO", allow_stale: bool = Fals
     reconciler = FillReconciler(OUTPUT_DIR / "fills.csv")
     om = OrderManager(OUTPUT_DIR / "orders_lifecycle.csv")
 
+    # Duplicate guard: the BROKER is the source of truth for what is currently
+    # working. orders_lifecycle.csv is append-only and never learns about
+    # cancellations/fills, so it must NOT gate submission (a cancelled-then-
+    # resubmitted order would be wrongly skipped). Fetch live open orders once.
+    try:
+        open_order_tickers = {oo.get("ticker") for oo in broker.get_open_orders()}
+    except Exception:
+        open_order_tickers = set()
+
     submitted_orders = []
     for _, order_row in orders.iterrows():
         order = build_ibkr_order(order_row, today, order_type)
@@ -671,27 +686,17 @@ def run_ibkr_paper(today: str, order_type: str = "MOO", allow_stale: bool = Fals
                   f"{order_row['shares']} shares floors to < 1")
             continue
 
-        # Duplicate checks
-        if _has_pending_order(order.ticker, today):
-            print(f"    SKIP {order.ticker}: pending order exists for today")
-            continue
-
-        # Check IBKR open orders for this ticker
-        has_ibkr_dup = False
-        try:
-            ibkr_open = broker.get_open_orders()
-            if any(oo.get("ticker") == order.ticker for oo in ibkr_open):
-                print(f"    SKIP {order.ticker}: open IBKR order already exists")
-                has_ibkr_dup = True
-        except Exception:
-            pass
-
-        if has_ibkr_dup:
+        # Skip only if the broker already has a live working order for this ticker.
+        if order.ticker in open_order_tickers:
+            print(f"    SKIP {order.ticker}: open IBKR order already exists")
             continue
 
         try:
+            # submit_order also re-checks live open orders / holdings and rejects
+            # genuine duplicates or shorts against current broker state.
             broker.submit_order(order)  # logs its own SUBMITTED line with the broker id
             submitted_orders.append(order)
+            open_order_tickers.add(order.ticker)
         except Exception as e:
             print(f"    REJECTED {order.ticker}: {e}")
 
@@ -876,23 +881,6 @@ def reset_sim_state(sim: Path = PORTFOLIO_STATE_FILE_SIM) -> list:
     return removed
 
 
-def _has_pending_order(ticker: str, today: str) -> bool:
-    """Check orders_lifecycle.csv for existing SUBMITTED/PENDING order for same ticker+date."""
-    lifecycle_path = OUTPUT_DIR / "orders_lifecycle.csv"
-    if not lifecycle_path.exists():
-        return False
-    try:
-        import pandas as pd
-        df = pd.read_csv(lifecycle_path)
-        if "ticker" in df.columns and "date" in df.columns and "status" in df.columns:
-            match = df[(df["ticker"] == ticker) & (df["date"] == today) &
-                       (df["status"].isin(["SUBMITTED", "PENDING", "FILLED"]))]
-            return len(match) > 0
-    except Exception:
-        pass
-    return False
-
-
 def _save_and_report(portfolio: Portfolio, orders, predictions, today: str,
                      update_state: bool = True) -> None:
     print("\n[7/7] Saving state and generating report...")
@@ -930,7 +918,11 @@ def parse_args():
                             "MOO orders. Changes the allowed submission window to RTH.")
     parser.add_argument("--allow-stale-data", action="store_true",
                        help="Override the stale-price guard and submit paper orders even "
-                            "when the latest bar is older than MAX_DATA_STALENESS_DAYS.")
+                            "when the latest bar is older than MAX_DATA_STALENESS_TRADING_DAYS.")
+    parser.add_argument("--force-resubmit", action="store_true",
+                       help="Re-run ibkr_paper the same day even if it already ran today. "
+                            "Safe: live broker open-order/holding checks prevent duplicate "
+                            "orders. Use after manually cancelling orders at the broker.")
     parser.add_argument("--reconcile-only", action="store_true",
                        help="Fetch fills from IBKR, update portfolio, no new orders")
     parser.add_argument("--override-time-check", action="store_true",
@@ -995,7 +987,7 @@ def main():
         elif args.mode == "ibkr_dry_run":
             run_ibkr_dry_run(today, order_type, args.allow_stale_data)
         elif args.mode == "ibkr_paper":
-            run_ibkr_paper(today, order_type, args.allow_stale_data)
+            run_ibkr_paper(today, order_type, args.allow_stale_data, args.force_resubmit)
 
         log_run(args.mode, "COMPLETE", "success")
     except Exception as e:

@@ -179,6 +179,14 @@ python run_daily.py --mode ibkr_paper --confirm-paper-orders --market-hours
 
 MKT orders fill within seconds, so you can reconcile in the same session a moment later rather than waiting for the next open. The same `--override-time-check` + `--i-understand-time-risk` pair is required to submit outside `09:30–16:00 ET` in this mode. `--market-hours` also works with `--mode ibkr_dry_run` to preview MKT orders.
 
+**Re-submitting after a manual cancel.** A successful paper run records the day in `portfolio_state.paper.json`, so re-running `ibkr_paper` the same day is blocked by the duplicate-run guard. If you cancelled the orders at the broker and want to resubmit, add `--force-resubmit`:
+
+```powershell
+python run_daily.py --mode ibkr_paper --confirm-paper-orders --force-resubmit
+```
+
+This is safe: the duplicate guard is the only thing bypassed. Submission still consults **live broker state** — any ticker with a working order or an existing holding at the broker is skipped, so `--force-resubmit` cannot create duplicate orders. (The broker, not `orders_lifecycle.csv`, is the source of truth for what is currently working — the CSV is an append-only log and does not reflect cancellations.)
+
 Guardrails enforced, in order:
 - `--confirm-paper-orders` is **required**; without it the run aborts.
 - Hard-blocked outside **04:00–09:25 ET** unless you pass *both* `--override-time-check` and `--i-understand-time-risk`.
