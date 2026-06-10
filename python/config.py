@@ -107,9 +107,12 @@ FEE_CAP_PCT = 0.01
 MAX_PORTFOLIO_RISK_PCT = 0.02
 DRY_RUN = True
 
-# Maximum age (in CALENDAR days) of the latest price bar the pipeline trades on.
-# If the freshest bar is older than this, the daily price update likely failed
-# (yfinance down / network) and ibkr_paper submission is blocked. 4 days covers
-# a normal weekend plus one market holiday without false positives; raise it for
-# back-to-back holiday closures. Override a single run with --allow-stale-data.
-MAX_DATA_STALENESS_DAYS = 4
+# Maximum age (in TRADING SESSIONS) of the latest price bar the pipeline trades
+# on. Counted as NYSE sessions strictly after the latest bar up to and including
+# today, so weekends never inflate it (a Friday bar read Monday = 1 session) and
+# market holidays are excluded when pandas_market_calendars is installed
+# (weekday-only fallback otherwise). If the freshest bar is older than this, the
+# daily price update likely failed (yfinance down / network) and ibkr_paper
+# submission is blocked. 3 sessions tolerates a one-session data delay plus a
+# normal lag. Override a single run with --allow-stale-data.
+MAX_DATA_STALENESS_TRADING_DAYS = 3

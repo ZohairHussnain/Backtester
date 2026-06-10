@@ -30,7 +30,7 @@ import argparse
 import csv
 import shutil
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -42,7 +42,7 @@ from config import (
     state_file_for_mode,
     ORDERS_FILE, OUTPUT_DIR, STARTING_CAPITAL, IBKR_PAPER_STRATEGY_CAPITAL,
     THRESHOLD, SLIPPAGE, FEE_PER_SHARE, FEE_MIN, FEE_CAP_PCT,
-    MAX_DATA_STALENESS_DAYS,
+    MAX_DATA_STALENESS_TRADING_DAYS,
 )
 from download_data import update_prices
 from feature_engine import get_latest_features, load_prices
@@ -385,39 +385,72 @@ def create_broker(mode: str):
 # Signal + order generation (shared)
 # ======================================================================
 
+def _nyse_holidays_between(start, end):
+    """NYSE holiday dates in [start, end] as np.datetime64, or [] if the
+    pandas_market_calendars package is not installed (weekday-only fallback)."""
+    try:
+        import pandas_market_calendars as mcal
+        import pandas as pd
+        cal = mcal.get_calendar("XNYS")
+        hol = cal.holidays().holidays  # array of datetime64[ns]
+        s = pd.Timestamp(start).to_datetime64()
+        e = pd.Timestamp(end).to_datetime64()
+        return [h for h in hol if s <= h <= e]
+    except Exception:
+        return []
+
+
+def trading_days_between(latest_date: str, today: str) -> int:
+    """Count NYSE trading sessions strictly after `latest_date`, up to and
+    including `today`. Weekends are always excluded; market holidays are too
+    when pandas_market_calendars is available. Returns -1 if dates won't parse.
+
+    Examples (no holidays): Mon->Tue = 1; Fri->Mon = 1; Fri->Tue = 2; same day = 0.
+    """
+    import numpy as np
+    try:
+        latest = datetime.strptime(str(latest_date)[:10], "%Y-%m-%d").date()
+        now = datetime.strptime(str(today)[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return -1
+    # busday_count is [begin inclusive, end exclusive); we want (latest, now].
+    begin = latest + timedelta(days=1)
+    end = now + timedelta(days=1)
+    holidays = _nyse_holidays_between(begin, now)
+    return int(np.busday_count(begin, end, holidays=holidays))
+
+
 def check_data_freshness(latest_date: str, today: str, mode: str,
                          allow_stale: bool = False) -> None:
     """Guard against trading on stale prices.
 
     The daily price update is best-effort (yfinance errors are swallowed and the
     run continues on cached data), so a network/yfinance outage can silently
-    leave the latest bar days old. This checks the freshest bar the pipeline is
-    about to trade on and, for ibkr_paper, BLOCKS submission when it is older
-    than MAX_DATA_STALENESS_DAYS calendar days. Other modes warn only.
-    Pass --allow-stale-data to override the block deliberately.
+    leave the latest bar days old. This measures the age of the freshest bar the
+    pipeline is about to trade on in TRADING SESSIONS (weekend/holiday aware) and,
+    for ibkr_paper, BLOCKS submission when it exceeds MAX_DATA_STALENESS_TRADING_DAYS.
+    Other modes warn only. Pass --allow-stale-data to override the block.
     """
-    try:
-        latest = datetime.strptime(str(latest_date)[:10], "%Y-%m-%d")
-        now = datetime.strptime(str(today)[:10], "%Y-%m-%d")
-    except (ValueError, TypeError):
+    gap = trading_days_between(latest_date, today)
+    if gap < 0:
         print(f"  WARNING: Could not parse data date '{latest_date}' for staleness check.")
         return
 
-    gap_days = (now - latest).days
-    if gap_days <= MAX_DATA_STALENESS_DAYS:
+    if gap <= MAX_DATA_STALENESS_TRADING_DAYS:
         print(f"  Data freshness: latest bar {str(latest_date)[:10]} "
-              f"({gap_days}d old, threshold {MAX_DATA_STALENESS_DAYS}d). OK.")
+              f"({gap} trading session(s) old, threshold "
+              f"{MAX_DATA_STALENESS_TRADING_DAYS}). OK.")
         return
 
     bang = "!" * 56
     print(f"  {bang}")
     print(f"  WARNING: STALE DATA -- latest bar is {str(latest_date)[:10]}, "
-          f"{gap_days} days old (threshold {MAX_DATA_STALENESS_DAYS}d).")
+          f"{gap} trading sessions old (threshold {MAX_DATA_STALENESS_TRADING_DAYS}).")
     print(f"  The daily price update likely failed (check yfinance / network).")
     print(f"  {bang}")
 
     if mode == "ibkr_paper" and not allow_stale:
-        log_run(mode, "BLOCKED", f"stale data: latest {str(latest_date)[:10]} ({gap_days}d)")
+        log_run(mode, "BLOCKED", f"stale data: latest {str(latest_date)[:10]} ({gap} sessions)")
         print(f"  BLOCKED: refusing to submit paper orders on stale data.")
         print(f"  Fix the price data and re-run, or pass --allow-stale-data to override.")
         sys.exit(1)

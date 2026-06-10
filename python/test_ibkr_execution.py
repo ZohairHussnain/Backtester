@@ -420,11 +420,28 @@ def _exits(fn, *args, **kwargs):
         run_daily.log_run = saved_log
 
 
+def test_trading_day_counting():
+    print("\n[V0] trading-session counting is weekend-aware")
+    # 2026-06-05 Fri, 2026-06-08 Mon, 2026-06-09 Tue, 2026-06-10 Wed
+    check(run_daily.trading_days_between("2026-06-08", "2026-06-09") == 1, "Mon->Tue = 1 session")
+    check(run_daily.trading_days_between("2026-06-05", "2026-06-08") == 1, "Fri->Mon = 1 (weekend skipped)")
+    check(run_daily.trading_days_between("2026-06-05", "2026-06-09") == 2, "Fri->Tue = 2 sessions")
+    check(run_daily.trading_days_between("2026-06-09", "2026-06-09") == 0, "same day = 0")
+    check(run_daily.trading_days_between("bad", "2026-06-10") == -1, "unparseable -> -1")
+
+
 def test_fresh_data_passes():
     print("\n[V] fresh data passes the staleness guard")
     blocked = _exits(run_daily.check_data_freshness, "2026-06-09", "2026-06-10",
                      "ibkr_paper", False)
-    check(blocked is False, "1-day-old bar does not block ibkr_paper")
+    check(blocked is False, "1-session-old bar does not block ibkr_paper")
+
+
+def test_weekend_gap_not_stale():
+    print("\n[V1] a Friday bar read on Monday is NOT stale")
+    blocked = _exits(run_daily.check_data_freshness, "2026-06-05", "2026-06-08",
+                     "ibkr_paper", False)
+    check(blocked is False, "Fri->Mon (1 session) does not block despite 3 calendar days")
 
 
 def test_stale_data_blocks_paper():
@@ -488,7 +505,9 @@ def main():
     test_time_safety_market_hours_during_rth_proceeds()
     test_time_safety_moo_during_rth_blocks()
     test_time_safety_overrides_proceed_outside_window()
+    test_trading_day_counting()
     test_fresh_data_passes()
+    test_weekend_gap_not_stale()
     test_stale_data_blocks_paper()
     test_stale_data_warns_only_in_sim()
     test_allow_stale_override()

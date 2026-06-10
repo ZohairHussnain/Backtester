@@ -187,7 +187,7 @@ Guardrails enforced, in order:
   - **Buying-power sufficiency** — broker buying power must cover the intended BUY notional.
   - **Position check** — every *local* position must be backed at the broker (hard block); unrelated *broker-only* holdings are warnings, not blockers.
   - Logs broker equity / buying power / cash, local equity / cash, configured capital, and intended order notional.
-- **Stale-price guard** — the daily price update is best-effort (yfinance errors are swallowed and the run continues on cached data). If the freshest bar is older than `MAX_DATA_STALENESS_DAYS` (default 4 calendar days), `ibkr_paper` submission is **blocked** so you never trade on stale prices after a failed update. Override a single run with `--allow-stale-data`. Other modes warn only.
+- **Stale-price guard** — the daily price update is best-effort (yfinance errors are swallowed and the run continues on cached data). Staleness is measured in **NYSE trading sessions** (weekend-aware; holiday-aware too if `pandas_market_calendars` is installed, weekday-only otherwise). If the freshest bar is older than `MAX_DATA_STALENESS_TRADING_DAYS` (default 3 sessions), `ibkr_paper` submission is **blocked** so you never trade on stale prices after a failed update. A Friday bar read on Monday counts as 1 session, so normal weekends never trip it. Override a single run with `--allow-stale-data`. Other modes warn only.
 - **Integer shares** — all IBKR-bound orders are floored to whole shares (IBKR rejects fractional); orders that floor to < 1 share are skipped.
 - Per-ticker duplicate checks against `output/orders_lifecycle.csv` and live IBKR open orders.
 - No shorting: SELL only for tickers you actually hold; BUY skipped if already holding.
