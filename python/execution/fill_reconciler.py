@@ -67,7 +67,7 @@ class FillReconciler:
             order = self._match_order(bf, pending_orders)
             if order is None:
                 print(f"  WARNING: Unmatched fill {fill_id} "
-                      f"({bf.get('action')} {bf.get('ticker')}) — skipping")
+                      f"({bf.get('action')} {bf.get('ticker')}) -- skipping")
                 continue
 
             fill = Fill(
