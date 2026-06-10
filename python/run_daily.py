@@ -6,12 +6,22 @@ Usage:
     python run_daily.py --mode sim                   # simulated fills
     python run_daily.py --mode ibkr_dry_run          # connect IBKR, log orders, no submission
     python run_daily.py --mode ibkr_paper --confirm-paper-orders  # submit MOO to IBKR paper
+    python run_daily.py --mode ibkr_paper --confirm-paper-orders --market-hours
+                                                     # submit immediate MKT orders during RTH
     python run_daily.py --reconcile-only             # fetch fills, update state, no new orders
+
+Order timing:
+    - Default: pre-market MOO (market-on-open, TIF=OPG). Submission window is
+      04:00-09:25 ET. These fill at the next open.
+    - --market-hours: immediate MKT orders (TIF=DAY) for running DURING regular
+      trading hours (09:30-16:00 ET). These fill right away, so reconcile in the
+      same run instead of waiting for the open.
 
 Safety (ibkr_paper):
     - Requires --confirm-paper-orders to submit any order.
-    - Hard-blocked outside 04:00-09:25 ET unless BOTH --override-time-check
-      AND --i-understand-time-risk are passed.
+    - Hard-blocked outside the active submission window (04:00-09:25 ET for MOO,
+      09:30-16:00 ET for --market-hours) unless BOTH --override-time-check AND
+      --i-understand-time-risk are passed.
     - Pre-flight checks compare local portfolio state vs IBKR broker state.
     - Mismatches block submission until reconciled.
 """
@@ -20,7 +30,7 @@ import argparse
 import csv
 import shutil
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -30,10 +40,9 @@ from config import (
     UNIVERSE_FILE, MODELS_DIR, PORTFOLIO_STATE_FILE,
     PORTFOLIO_STATE_FILE_SIM, PORTFOLIO_STATE_FILE_PAPER,
     state_file_for_mode,
-    ORDERS_FILE, OUTPUT_DIR, STARTING_CAPITAL, THRESHOLD,
-    SLIPPAGE, FEE_PER_SHARE, FEE_MIN, FEE_CAP_PCT,
-    IBKR_PAPER_STRATEGY_CAPITAL, IBKR_BUYING_POWER_SAFETY_FRAC,
-    floor_shares_for_ibkr,
+    ORDERS_FILE, OUTPUT_DIR, STARTING_CAPITAL, IBKR_PAPER_STRATEGY_CAPITAL,
+    THRESHOLD, SLIPPAGE, FEE_PER_SHARE, FEE_MIN, FEE_CAP_PCT,
+    MAX_DATA_STALENESS_TRADING_DAYS,
 )
 from download_data import update_prices
 from feature_engine import get_latest_features, load_prices
@@ -54,6 +63,12 @@ MOO_WINDOW_START_HOUR = 4
 MOO_WINDOW_START_MIN = 0
 MOO_WINDOW_END_HOUR = 9
 MOO_WINDOW_END_MIN = 25
+
+# Regular trading hours window (ET) — used by --market-hours for immediate MKT orders.
+RTH_START_HOUR = 9
+RTH_START_MIN = 30
+RTH_END_HOUR = 16
+RTH_END_MIN = 0
 
 # Tolerance for local vs broker equity mismatch (fraction)
 EQUITY_MISMATCH_TOLERANCE = 0.10
@@ -89,20 +104,44 @@ def is_in_moo_window() -> bool:
     return start <= now <= end
 
 
+def is_in_rth() -> bool:
+    """Check if current ET time is within regular trading hours (09:30-16:00 ET)."""
+    now = get_et_now()
+    start = now.replace(hour=RTH_START_HOUR, minute=RTH_START_MIN, second=0)
+    end = now.replace(hour=RTH_END_HOUR, minute=RTH_END_MIN, second=0)
+    return start <= now <= end
+
+
 def check_time_safety(args) -> None:
-    """Hard-block ibkr_paper outside MOO window unless both override flags are set."""
+    """Hard-block ibkr_paper outside the active submission window unless both
+    override flags are set.
+
+    The active window depends on the order type:
+      - default (MOO):     04:00-09:25 ET pre-market
+      - --market-hours (MKT): 09:30-16:00 ET regular trading hours
+    """
     now_et = get_et_now()
-    in_window = is_in_moo_window()
     time_str = now_et.strftime("%H:%M:%S ET")
 
+    if getattr(args, "market_hours", False):
+        in_window = is_in_rth()
+        window_label = "RTH"
+        window_desc = "09:30-16:00 ET"
+        order_desc = "MKT orders"
+    else:
+        in_window = is_in_moo_window()
+        window_label = "MOO"
+        window_desc = "04:00-09:25 ET"
+        order_desc = "MOO orders"
+
     if in_window:
-        print(f"  Time check: {time_str} -- within MOO window (04:00-09:25 ET). OK.")
+        print(f"  Time check: {time_str} -- within {window_label} window ({window_desc}). OK.")
         return
 
-    print(f"  Time check: {time_str} -- OUTSIDE MOO window (04:00-09:25 ET).")
+    print(f"  Time check: {time_str} -- OUTSIDE {window_label} window ({window_desc}).")
 
     if args.mode == "ibkr_dry_run":
-        print(f"  WARNING: Outside MOO window. Dry-run proceeds (no orders submitted).")
+        print(f"  WARNING: Outside {window_label} window. Dry-run proceeds (no orders submitted).")
         return
 
     if args.mode == "ibkr_paper":
@@ -112,13 +151,13 @@ def check_time_safety(args) -> None:
             return
         elif args.override_time_check:
             print(f"  BLOCKED: --override-time-check alone is insufficient.")
-            print(f"  You must also pass --i-understand-time-risk to submit outside MOO window.")
+            print(f"  You must also pass --i-understand-time-risk to submit outside the {window_label} window.")
             log_run(args.mode, "BLOCKED", f"missing --i-understand-time-risk at {time_str}")
             sys.exit(1)
         else:
-            print(f"  BLOCKED: MOO orders must be submitted between 04:00-09:25 ET.")
+            print(f"  BLOCKED: {order_desc} must be submitted between {window_desc}.")
             print(f"  To override, pass BOTH --override-time-check AND --i-understand-time-risk.")
-            log_run(args.mode, "BLOCKED", f"outside MOO window at {time_str}")
+            log_run(args.mode, "BLOCKED", f"outside {window_label} window at {time_str}")
             sys.exit(1)
 
 
@@ -126,143 +165,133 @@ def check_time_safety(args) -> None:
 # Pre-flight sanity checks (ibkr_paper only)
 # ======================================================================
 
-def _latest_close(ticker: str) -> float:
-    """Latest close price for a ticker, or 0.0 if unavailable."""
-    try:
-        return float(load_prices(ticker).iloc[-1]["close"])
-    except Exception:
-        return 0.0
+def intended_buy_notional(orders) -> float:
+    """Estimate total cash needed for today's BUY orders from latest closes.
 
-
-def _intended_buy_notional(orders):
-    """Sum the floored-share notional of today's BUY orders.
-
-    Uses the SAME integer share count the broker will receive, so the notional
-    reflects what we actually intend to spend. Returns (total, line_items).
+    Uses integer share quantities (IBKR floors fractional), so the estimate
+    matches what will actually be submitted.
     """
     total = 0.0
-    items = []
+    if orders is None or orders.empty:
+        return 0.0
+    import math
     for _, o in orders.iterrows():
         if o.get("action") != "BUY":
             continue
-        ishares = floor_shares_for_ibkr(o.get("shares", 0))
-        if ishares < 1:
+        shares = math.floor(o.get("shares", 0))
+        if shares < 1:
             continue
-        price = _latest_close(o["ticker"])
-        notional = ishares * price
-        total += notional
-        items.append((o["ticker"], ishares, price, notional))
-    return total, items
+        try:
+            prices = load_prices(o["ticker"])
+            price = prices.iloc[-1]["close"]
+        except Exception:
+            price = 0
+        total += shares * price
+    return total
 
 
-def preflight_checks(broker, portfolio: Portfolio, orders) -> bool:
-    """Verify it is safe to submit today's orders to IBKR paper.
+def preflight_checks(broker, portfolio: Portfolio, orders=None) -> bool:
+    """Compare local state vs IBKR broker state. Return True if safe to proceed.
 
-    Policy (the paper account is funded far above the strategy ledger by design):
-      - Equity mismatch is WARNING-ONLY (never blocks).
-      - Buying-power sufficiency is a HARD gate: intended BUY notional must fit
-        within IBKR_BUYING_POWER_SAFETY_FRAC of broker available funds.
-      - Position reconciliation (option B): the strategy owns only the tickers
-        in its ledger. Unrelated broker positions are ignored (logged). It is a
-        HARD failure if a strategy ticker is missing at the broker or its broker
-        share count disagrees with the ledger.
-
-    Returns True if safe to proceed.
+    The strategy runs as a SUB-ALLOCATION inside a larger IBKR paper account, so
+    broker equity is expected to be MUCH larger than local strategy equity. The
+    checks here are therefore:
+      1. Equity guard is ONE-SIDED: broker must be >= local (broker below local
+         signals corrupt/stale local state). A broker surplus is fine.
+      2. Buying-power sufficiency: broker must have enough buying power for the
+         intended BUY notional.
+      3. Position check: every LOCAL position must be backed at the broker
+         (hard fail). Broker-only positions are unrelated account holdings and
+         are reported as warnings, never blockers.
     """
     print("\n  Pre-flight sanity checks...")
     all_ok = True
 
-    acct = {}
+    # 1. Account value comparison (one-sided) + buying power sufficiency
     try:
         acct = broker.get_account_state()
+        broker_equity = acct.get("NetLiquidation", 0)
+        broker_cash = acct.get("TotalCashValue", 0)
+        broker_bp = acct.get("BuyingPower", 0)
+        local_equity = portfolio.equity
+        local_cash = portfolio.cash
+        order_notional = intended_buy_notional(orders)
+
+        print(f"    Broker equity:        ${broker_equity:,.2f}")
+        print(f"    Broker buying power:  ${broker_bp:,.2f}")
+        print(f"    Broker cash:          ${broker_cash:,.2f}")
+        print(f"    Local strategy equity:${local_equity:,.2f}")
+        print(f"    Local strategy cash:  ${local_cash:,.2f}")
+        print(f"    Configured capital:   ${IBKR_PAPER_STRATEGY_CAPITAL:,.2f}")
+        print(f"    Intended BUY notional:${order_notional:,.2f}")
+
+        # One-sided equity guard: broker below local => stale/corrupt local state.
+        if broker_equity > 0 and local_equity > 0:
+            if broker_equity < local_equity * (1 - EQUITY_MISMATCH_TOLERANCE):
+                shortfall = (local_equity - broker_equity) / local_equity
+                print(f"    FAIL: Broker equity is {shortfall:.1%} BELOW local equity.")
+                print(f"    This signals corrupt/stale local state. Run --reconcile-only first.")
+                all_ok = False
+            else:
+                print(f"    OK: Broker equity >= local strategy equity (sub-allocation).")
+
+        # Buying-power sufficiency for today's BUYs.
+        if order_notional > 0:
+            if broker_bp > 0 and broker_bp < order_notional:
+                print(f"    FAIL: Buying power ${broker_bp:,.2f} < intended "
+                      f"BUY notional ${order_notional:,.2f}.")
+                all_ok = False
+            else:
+                print(f"    OK: Buying power covers intended BUY notional.")
     except Exception as e:
-        print(f"    WARNING: Could not fetch account state ({e}).")
+        print(f"    WARNING: Could not fetch account state ({e}). Skipping equity/BP check.")
 
-    broker_equity = acct.get("NetLiquidation", 0.0)
-    broker_cash = acct.get("TotalCashValue", 0.0)
-    broker_bp = acct.get("BuyingPower", broker_cash)
-    available = broker_bp if broker_bp > 0 else broker_cash
-    local_equity = portfolio.equity
-    local_cash = portfolio.cash
-
-    intended_notional, _ = _intended_buy_notional(orders)
-
-    # --- Structured state log ---
-    print("    --- account state ---")
-    print(f"    Broker equity (NetLiquidation): ${broker_equity:,.2f}")
-    print(f"    Broker cash (TotalCashValue):   ${broker_cash:,.2f}")
-    print(f"    Broker buying power:            ${broker_bp:,.2f}")
-    print(f"    Broker available funds:         ${available:,.2f}")
-    print(f"    Local strategy equity:          ${local_equity:,.2f}")
-    print(f"    Local strategy cash:            ${local_cash:,.2f}")
-    print(f"    Configured strategy capital:    ${IBKR_PAPER_STRATEGY_CAPITAL:,.2f}")
-    print(f"    Intended BUY notional:          ${intended_notional:,.2f}")
-    print("    ---------------------")
-
-    # 1. Equity mismatch -- WARNING ONLY.
-    if broker_equity > 0 and local_equity > 0:
-        diff = abs(broker_equity - local_equity) / max(broker_equity, local_equity)
-        if diff > EQUITY_MISMATCH_TOLERANCE:
-            print(f"    NOTE: broker/local equity differ {diff:.1%} -- expected "
-                  f"(strategy trades ${IBKR_PAPER_STRATEGY_CAPITAL:,.0f}, not the full "
-                  f"account). Not blocking.")
-
-    # 2. Buying-power sufficiency -- HARD GATE.
-    if intended_notional > 0:
-        budget = available * IBKR_BUYING_POWER_SAFETY_FRAC
-        if intended_notional > budget:
-            print(f"    FAIL: intended BUY notional ${intended_notional:,.2f} exceeds "
-                  f"{IBKR_BUYING_POWER_SAFETY_FRAC:.0%} of broker available funds "
-                  f"(${budget:,.2f}). Not enough buying power.")
-            all_ok = False
-        else:
-            print(f"    OK: buying power sufficient (need ${intended_notional:,.2f}, "
-                  f"budget ${budget:,.2f}).")
-
-    # 3. Position reconciliation -- option B (strategy owns only ledger tickers).
-    pos_ok = True
+    # 2. Position comparison (local-backed is a hard requirement; broker-only is OK)
     try:
         broker_positions = broker.get_positions()
+        local_positions = set(portfolio.open_positions.keys())
         broker_tickers = set(broker_positions.keys())
-        local_positions = portfolio.open_positions
-        local_tickers = set(local_positions.keys())
 
-        unrelated = broker_tickers - local_tickers
-        if unrelated:
-            print(f"    NOTE: ignoring {len(unrelated)} broker position(s) not owned "
-                  f"by this strategy: {sorted(unrelated)}")
+        broker_only = broker_tickers - local_positions
+        local_only = local_positions - broker_tickers
 
-        missing_at_broker = local_tickers - broker_tickers
-        if missing_at_broker:
-            print(f"    FAIL: strategy holds positions absent at broker: "
-                  f"{sorted(missing_at_broker)}. Run --reconcile-only to sync.")
+        if local_only:
+            print(f"    FAIL: Local state has positions not at broker: {local_only}")
+            print(f"    Run --reconcile-only to sync before submitting.")
             all_ok = False
-            pos_ok = False
 
-        for t in sorted(local_tickers & broker_tickers):
-            local_sh = float(local_positions[t].get("shares", 0))
-            broker_sh = float(broker_positions[t].get("shares", 0))
-            if abs(local_sh - broker_sh) > 1e-6:
-                print(f"    FAIL: {t} share mismatch -- local {local_sh:g}, "
-                      f"broker {broker_sh:g}. Run --reconcile-only to sync.")
+        # Shared tickers: broker must hold at least the local share count.
+        for ticker in (local_positions & broker_tickers):
+            local_shares = portfolio.open_positions[ticker].get("shares", 0)
+            broker_shares = broker_positions[ticker].get("shares", 0)
+            if broker_shares < local_shares:
+                print(f"    FAIL: {ticker} broker shares {broker_shares} < local {local_shares}.")
                 all_ok = False
-                pos_ok = False
 
-        if pos_ok:
-            print(f"    OK: strategy positions reconcile with broker "
-                  f"({len(local_tickers)} owned).")
+        if broker_only:
+            print(f"    WARNING: Broker holds positions not tracked by the strategy "
+                  f"(unrelated account holdings): {broker_only}")
+
+        if not local_only and not (local_positions & broker_tickers):
+            print(f"    OK: No local positions to verify ({len(local_positions)} tracked).")
+        elif not local_only:
+            print(f"    OK: All {len(local_positions)} local positions backed at broker.")
     except Exception as e:
-        print(f"    FAIL: Could not fetch/verify positions ({e}). Blocking to be safe.")
-        all_ok = False
+        print(f"    WARNING: Could not fetch positions ({e}). Skipping position check.")
 
-    # 4. Open order check -- informational.
+    # 3. Open order check
     try:
         broker_orders = broker.get_open_orders()
         if broker_orders:
-            desc = [f"{bo.get('action','')} {bo.get('shares','')} {bo.get('ticker','')}"
-                    for bo in broker_orders]
-            print(f"    WARNING: {len(broker_orders)} open order(s) at broker: {desc}. "
-                  f"These may conflict with today's submissions.")
+            known_tickers = set()
+            unknown = []
+            for bo in broker_orders:
+                known_tickers.add(bo.get("ticker", ""))
+                # Check if this was submitted by us (hard to verify without order_id mapping)
+                unknown.append(f"{bo.get('action','')} {bo.get('shares','')} {bo.get('ticker','')}")
+            if unknown:
+                print(f"    WARNING: {len(broker_orders)} open orders at broker: {unknown}")
+                print(f"    These may conflict with today's submissions.")
         else:
             print(f"    OK: No open orders at broker.")
     except Exception as e:
@@ -296,19 +325,25 @@ def print_order_summary(orders, portfolio: Portfolio, broker) -> None:
         return
 
     total_value = 0.0
-    print(f"\n  Orders to submit (whole shares -- IBKR rejects fractions):")
+    print(f"\n  Orders to submit:")
     print(f"  {'Action':<6} {'Ticker':<8} {'Shares':>8} {'Est.Value':>12} {'Stop':>8} {'Target':>8} {'Prob':>6}")
     print(f"  {'-'*58}")
 
     for _, o in orders.iterrows():
-        ishares = floor_shares_for_ibkr(o.get("shares", 0))
-        if ishares < 1:
-            continue  # skipped at submission; don't show a phantom line
-        price = _latest_close(o["ticker"])
-        est_val = ishares * price
+        # Show the floored (integer) quantity that will actually be submitted.
+        shares = floor_shares_for_ibkr(o.get("shares", 0))
+        if shares < 1:
+            continue
+        # Estimate value from latest close
+        try:
+            prices = load_prices(o["ticker"])
+            price = prices.iloc[-1]["close"]
+        except Exception:
+            price = 0
+        est_val = shares * price
         total_value += est_val if o.get("action") == "BUY" else 0
 
-        print(f"  {o.get('action',''):<6} {o.get('ticker',''):<8} {ishares:>8d} "
+        print(f"  {o.get('action',''):<6} {o.get('ticker',''):<8} {shares:>8d} "
               f"${est_val:>11,.2f} ${o.get('stop_price',0):>7.2f} "
               f"${o.get('target_price',0):>7.2f} {o.get('probability',0):>5.4f}")
 
@@ -350,7 +385,79 @@ def create_broker(mode: str):
 # Signal + order generation (shared)
 # ======================================================================
 
-def generate_signals_and_orders(portfolio: Portfolio, today: str):
+def _nyse_holidays_between(start, end):
+    """NYSE holiday dates in [start, end] as np.datetime64, or [] if the
+    pandas_market_calendars package is not installed (weekday-only fallback)."""
+    try:
+        import pandas_market_calendars as mcal
+        import pandas as pd
+        cal = mcal.get_calendar("XNYS")
+        hol = cal.holidays().holidays  # array of datetime64[ns]
+        s = pd.Timestamp(start).to_datetime64()
+        e = pd.Timestamp(end).to_datetime64()
+        return [h for h in hol if s <= h <= e]
+    except Exception:
+        return []
+
+
+def trading_days_between(latest_date: str, today: str) -> int:
+    """Count NYSE trading sessions strictly after `latest_date`, up to and
+    including `today`. Weekends are always excluded; market holidays are too
+    when pandas_market_calendars is available. Returns -1 if dates won't parse.
+
+    Examples (no holidays): Mon->Tue = 1; Fri->Mon = 1; Fri->Tue = 2; same day = 0.
+    """
+    import numpy as np
+    try:
+        latest = datetime.strptime(str(latest_date)[:10], "%Y-%m-%d").date()
+        now = datetime.strptime(str(today)[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return -1
+    # busday_count is [begin inclusive, end exclusive); we want (latest, now].
+    begin = latest + timedelta(days=1)
+    end = now + timedelta(days=1)
+    holidays = _nyse_holidays_between(begin, now)
+    return int(np.busday_count(begin, end, holidays=holidays))
+
+
+def check_data_freshness(latest_date: str, today: str, mode: str,
+                         allow_stale: bool = False) -> None:
+    """Guard against trading on stale prices.
+
+    The daily price update is best-effort (yfinance errors are swallowed and the
+    run continues on cached data), so a network/yfinance outage can silently
+    leave the latest bar days old. This measures the age of the freshest bar the
+    pipeline is about to trade on in TRADING SESSIONS (weekend/holiday aware) and,
+    for ibkr_paper, BLOCKS submission when it exceeds MAX_DATA_STALENESS_TRADING_DAYS.
+    Other modes warn only. Pass --allow-stale-data to override the block.
+    """
+    gap = trading_days_between(latest_date, today)
+    if gap < 0:
+        print(f"  WARNING: Could not parse data date '{latest_date}' for staleness check.")
+        return
+
+    if gap <= MAX_DATA_STALENESS_TRADING_DAYS:
+        print(f"  Data freshness: latest bar {str(latest_date)[:10]} "
+              f"({gap} trading session(s) old, threshold "
+              f"{MAX_DATA_STALENESS_TRADING_DAYS}). OK.")
+        return
+
+    bang = "!" * 56
+    print(f"  {bang}")
+    print(f"  WARNING: STALE DATA -- latest bar is {str(latest_date)[:10]}, "
+          f"{gap} trading sessions old (threshold {MAX_DATA_STALENESS_TRADING_DAYS}).")
+    print(f"  The daily price update likely failed (check yfinance / network).")
+    print(f"  {bang}")
+
+    if mode == "ibkr_paper" and not allow_stale:
+        log_run(mode, "BLOCKED", f"stale data: latest {str(latest_date)[:10]} ({gap} sessions)")
+        print(f"  BLOCKED: refusing to submit paper orders on stale data.")
+        print(f"  Fix the price data and re-run, or pass --allow-stale-data to override.")
+        sys.exit(1)
+
+
+def generate_signals_and_orders(portfolio: Portfolio, today: str,
+                                mode: str = "sim", allow_stale: bool = False):
     print("\n[1/7] Updating prices...")
     try:
         update_prices(UNIVERSE_FILE)
@@ -365,6 +472,9 @@ def generate_signals_and_orders(portfolio: Portfolio, today: str):
         print("ERROR: No features computed. Aborting.")
         sys.exit(1)
     print(f"  Features for {len(features)} tickers on {features['date'].iloc[0]}")
+
+    # Block trading on stale prices (ibkr_paper) / warn otherwise.
+    check_data_freshness(str(features["date"].max()), today, mode, allow_stale)
 
     print("\n[3/7] Generating predictions...")
     predictor = Predictor(MODELS_DIR)
@@ -397,7 +507,7 @@ def generate_signals_and_orders(portfolio: Portfolio, today: str):
 def run_sim(today: str):
     portfolio = Portfolio(state_file_for_mode("sim"), STARTING_CAPITAL)
     is_duplicate = check_duplicate(portfolio, today)
-    orders, predictions, _ = generate_signals_and_orders(portfolio, today)
+    orders, predictions, _ = generate_signals_and_orders(portfolio, today, "sim")
 
     print("\n[6/7] Executing (simulated fills)...")
     if not is_duplicate and not orders.empty:
@@ -441,19 +551,65 @@ def _apply_sim_orders(orders, portfolio: Portfolio, today: str) -> None:
 
 
 # ======================================================================
+# IBKR integer-share enforcement
+# ======================================================================
+
+def floor_shares_for_ibkr(shares) -> int:
+    """Floor a (possibly fractional) share quantity to whole shares.
+
+    IBKR does not accept fractional share orders, so every IBKR-bound order
+    must be a whole number. Floor rounding only; never rounds up.
+    """
+    import math
+    try:
+        return int(math.floor(float(shares)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def build_ibkr_order(order_row, today: str, order_type: str = "MOO"):
+    """Build an integer-share Order for IBKR, or None if it should be skipped.
+
+    Shares are floored to whole units. Orders that floor to < 1 share return
+    None so the caller can skip and log them. This is the single place where
+    IBKR-bound order quantities are made integer — both dry-run and paper go
+    through here, so the lifecycle log, summary, and submission all agree.
+
+    order_type selects the IBKR time-in-force at submission: "MOO" (pre-market
+    market-on-open) or "MKT" (immediate market order during trading hours).
+    """
+    shares = floor_shares_for_ibkr(order_row["shares"])
+    if shares < 1:
+        return None
+    action = Action.BUY if order_row["action"] == "BUY" else Action.SELL
+    return Order.create(
+        date=today, ticker=order_row["ticker"], action=action,
+        shares=shares,
+        stop_price=order_row.get("stop_price", 0),
+        target_price=order_row.get("target_price", 0),
+        reason=order_row.get("reason", ""),
+        probability=order_row.get("probability", 0),
+        order_type=order_type,
+    )
+
+
+# ======================================================================
 # Mode: ibkr_dry_run
 # ======================================================================
 
-def run_ibkr_dry_run(today: str):
+def run_ibkr_dry_run(today: str, order_type: str = "MOO", allow_stale: bool = False):
     portfolio = Portfolio(state_file_for_mode("ibkr_dry_run"), IBKR_PAPER_STRATEGY_CAPITAL)
-    orders, predictions, _ = generate_signals_and_orders(portfolio, today)
+    orders, predictions, _ = generate_signals_and_orders(
+        portfolio, today, "ibkr_dry_run", allow_stale)
 
-    print("\n[6/7] IBKR DRY RUN -- NO ORDERS SUBMITTED...")
+    print(f"\n[6/7] IBKR DRY RUN ({order_type}) -- NO ORDERS SUBMITTED...")
     broker = create_broker("ibkr_dry_run")
 
     for _, order_row in orders.iterrows():
-        order = _build_ibkr_order(order_row, today)
+        order = build_ibkr_order(order_row, today, order_type)
         if order is None:
+            print(f"    DRY RUN skip {order_row['ticker']}: "
+                  f"{order_row['shares']} shares floors to < 1")
             continue
         try:
             broker.submit_order(order)
@@ -470,16 +626,23 @@ def run_ibkr_dry_run(today: str):
 # Mode: ibkr_paper
 # ======================================================================
 
-def run_ibkr_paper(today: str):
+def run_ibkr_paper(today: str, order_type: str = "MOO", allow_stale: bool = False,
+                   force_resubmit: bool = False):
     portfolio = Portfolio(state_file_for_mode("ibkr_paper"), IBKR_PAPER_STRATEGY_CAPITAL)
     is_duplicate = check_duplicate(portfolio, today)
 
-    if is_duplicate:
+    if is_duplicate and not force_resubmit:
         print("  Duplicate run detected. Skipping order generation.")
-        print("  Use --reconcile-only to fetch fills.")
+        print("  Use --reconcile-only to fetch fills, or --force-resubmit to submit")
+        print("  again (e.g. after manually cancelling at the broker). Live broker")
+        print("  open-order/holding checks prevent duplicate orders.")
         return
+    if is_duplicate and force_resubmit:
+        print("  Duplicate run, but --force-resubmit set: proceeding.")
+        print("  Live broker checks will skip any ticker already working or held.")
 
-    orders, predictions, _ = generate_signals_and_orders(portfolio, today)
+    orders, predictions, _ = generate_signals_and_orders(
+        portfolio, today, "ibkr_paper", allow_stale)
 
     if orders.empty:
         print("\n[6/7] No orders to submit.")
@@ -506,65 +669,71 @@ def run_ibkr_paper(today: str):
     reconciler = FillReconciler(OUTPUT_DIR / "fills.csv")
     om = OrderManager(OUTPUT_DIR / "orders_lifecycle.csv")
 
+    # Duplicate guard: the BROKER is the source of truth for what is currently
+    # working. orders_lifecycle.csv is append-only and never learns about
+    # cancellations/fills, so it must NOT gate submission (a cancelled-then-
+    # resubmitted order would be wrongly skipped). Fetch live open orders once.
+    try:
+        open_order_tickers = {oo.get("ticker") for oo in broker.get_open_orders()}
+    except Exception:
+        open_order_tickers = set()
+
     submitted_orders = []
     for _, order_row in orders.iterrows():
-        order = _build_ibkr_order(order_row, today)
+        order = build_ibkr_order(order_row, today, order_type)
         if order is None:
+            print(f"    SKIP {order_row['ticker']}: "
+                  f"{order_row['shares']} shares floors to < 1")
             continue
 
-        # Duplicate checks
-        if _has_pending_order(order.ticker, today):
-            print(f"    SKIP {order.ticker}: pending order exists for today")
-            continue
-
-        # Check IBKR open orders for this ticker
-        has_ibkr_dup = False
-        try:
-            ibkr_open = broker.get_open_orders()
-            if any(oo.get("ticker") == order.ticker for oo in ibkr_open):
-                print(f"    SKIP {order.ticker}: open IBKR order already exists")
-                has_ibkr_dup = True
-        except Exception:
-            pass
-
-        if has_ibkr_dup:
+        # Skip only if the broker already has a live working order for this ticker.
+        if order.ticker in open_order_tickers:
+            print(f"    SKIP {order.ticker}: open IBKR order already exists")
             continue
 
         try:
-            broker.submit_order(order)
-            # Persist immediately (with broker_order_id) so a crash between
-            # submission and reconciliation still leaves a reconcilable record.
-            om.log_orders([order])
+            # submit_order also re-checks live open orders / holdings and rejects
+            # genuine duplicates or shorts against current broker state.
+            broker.submit_order(order)  # logs its own SUBMITTED line with the broker id
             submitted_orders.append(order)
-            print(f"    SUBMITTED: {order.action.value} {order.shares:.0f} {order.ticker}")
+            open_order_tickers.add(order.ticker)
         except Exception as e:
-            # submit_order set status=REJECTED before raising; persist for audit.
-            om.log_orders([order])
             print(f"    REJECTED {order.ticker}: {e}")
 
-    # Check for immediate fills
-    print("\n  Checking for immediate fills...")
-    broker_fills = broker.get_fills()
-    if broker_fills:
-        fills = reconciler.reconcile(broker_fills, submitted_orders)
+    om.log_orders(submitted_orders)
+
+    # Immediate-fill handling.
+    #
+    # MOO orders CANNOT fill before the open, so we never reconcile them here:
+    # ib.fills() returns the account's whole recent execution history, and
+    # applying any of it now would attach stale fills to today's pending orders.
+    # MOO fills are picked up by --reconcile-only after the open (matched on
+    # perm_id). Only MKT orders (run during RTH) can fill immediately.
+    applied = []
+    if order_type == "MKT":
+        print("\n  Checking for immediate fills...")
+        broker_fills = broker.get_fills()
+        fills = reconciler.reconcile(broker_fills, submitted_orders) if broker_fills else []
         for fill in fills:
             try:
-                if fill.action == Action.BUY:
-                    portfolio.record_entry(
-                        fill.ticker, fill.shares_filled, fill.fill_price,
-                        0, 0, today, fill.commission)
-                else:
-                    portfolio.record_exit(fill.ticker, fill.fill_price, today, "ibkr_fill")
-                print(f"    FILLED: {fill.action.value} {fill.shares_filled:.0f} "
-                      f"{fill.ticker} @ ${fill.fill_price:.2f}")
+                if apply_fill(portfolio, fill, today):
+                    applied.append(fill)
+                    print(f"    FILLED: {fill.action.value} {fill.shares_filled:.0f} "
+                          f"{fill.ticker} @ ${fill.fill_price:.2f}")
             except Exception as e:
                 print(f"    FILL ERROR {fill.ticker}: {e}")
+        if not applied:
+            print("  No immediate fills yet. MKT orders fill within seconds during RTH.")
+        print("  Run --reconcile-only shortly to fetch any remaining fills.")
     else:
-        print("  No immediate fills (MOO orders fill at market open).")
-        print("  Run --reconcile-only after market open to fetch fills.")
+        print("\n  MOO orders submitted. They fill at the market open.")
+        print("  Run --reconcile-only after the open to fetch fills.")
 
     broker.disconnect()
+    # Save state (commits processed_fill_ids atomically) BEFORE writing the
+    # fills audit log, so a crash can never leave an audited-but-unapplied fill.
     _save_and_report(portfolio, orders, predictions, today)
+    reconciler.log_fills(applied)
 
 
 # ======================================================================
@@ -593,41 +762,27 @@ def run_reconcile_only(today: str):
     print(f"  Found {len(broker_fills)} fills.")
 
     lifecycle_path = OUTPUT_DIR / "orders_lifecycle.csv"
-    pending_orders = []
-    if lifecycle_path.exists():
-        import pandas as pd
-        df = pd.read_csv(lifecycle_path)
-        # PARTIALLY_FILLED orders may still receive more executions, so they are
-        # reconcilable too.
-        reconcilable = ["SUBMITTED", "PENDING", "PARTIALLY_FILLED"]
-        for _, row in df[df["status"].isin(reconcilable)].iterrows():
-            bid = row.get("broker_order_id")
-            broker_order_id = str(bid) if pd.notna(bid) else None
-            pending_orders.append(Order(
-                order_id=row["order_id"], date=row["date"], ticker=row["ticker"],
-                action=Action(row["action"]), shares=row["shares"],
-                order_type=row.get("order_type", "MOO"),
-                stop_price=row.get("stop_price", 0),
-                target_price=row.get("target_price", 0),
-                status=OrderStatus(row["status"]), reason=row.get("reason", ""),
-                broker_order_id=broker_order_id,
-            ))
+    pending_orders = load_pending_orders_from_lifecycle(lifecycle_path)
 
     fills = reconciler.reconcile(broker_fills, pending_orders)
+    applied = []
     for fill in fills:
         try:
-            if fill.action == Action.BUY:
-                portfolio.record_entry(
-                    fill.ticker, fill.shares_filled, fill.fill_price,
-                    0, 0, today, fill.commission)
+            if apply_fill(portfolio, fill, today):
+                applied.append(fill)
+                print(f"    RECONCILED: {fill.action.value} {fill.shares_filled:.0f} "
+                      f"{fill.ticker} @ ${fill.fill_price:.2f}")
             else:
-                portfolio.record_exit(fill.ticker, fill.fill_price, today, "ibkr_fill")
-            print(f"    RECONCILED: {fill.action.value} {fill.shares_filled:.0f} "
-                  f"{fill.ticker} @ ${fill.fill_price:.2f}")
+                print(f"    SKIP {fill.ticker}: fill {fill.fill_id} already applied")
         except Exception as e:
             print(f"    RECONCILE ERROR {fill.ticker}: {e}")
 
+    if not applied:
+        print("  No NEW fills to apply (all already reconciled).")
+
+    # Save state (commits processed_fill_ids atomically) BEFORE the audit log.
     portfolio.save()
+    reconciler.log_fills(applied)
     broker.disconnect()
     print(f"  Portfolio updated. Cash: ${portfolio.cash:,.2f}")
 
@@ -635,6 +790,59 @@ def run_reconcile_only(today: str):
 # ======================================================================
 # Helpers
 # ======================================================================
+
+def apply_fill(portfolio: Portfolio, fill, today: str) -> bool:
+    """Apply a confirmed broker fill to the strategy ledger.
+
+    Returns True if the fill was applied, False if it was already processed
+    (idempotent skip). Uses the EXACT broker fill price and commission (no
+    simulated slippage/fee) and supports partial fills. The fill id is marked
+    processed in the same Portfolio state that records the fill's effect, so the
+    mark and the effect are committed together on the next atomic save().
+    """
+    if portfolio.is_fill_processed(fill.fill_id):
+        return False
+    fill_date = fill.filled_at[:10] if fill.filled_at else today
+    if fill.action == Action.BUY:
+        portfolio.apply_buy_fill(
+            fill.ticker, fill.shares_filled, fill.fill_price,
+            fill.commission, fill_date)
+    else:
+        portfolio.apply_sell_fill(
+            fill.ticker, fill.shares_filled, fill.fill_price,
+            fill.commission, fill_date, "ibkr_fill")
+    portfolio.mark_fill_processed(fill.fill_id)
+    return True
+
+
+def load_pending_orders_from_lifecycle(lifecycle_path: Path) -> list:
+    """Rebuild pending Order objects from orders_lifecycle.csv, INCLUDING the
+    broker_order_id / perm_id bridge fields needed to match IBKR fills.
+    """
+    pending = []
+    if not lifecycle_path.exists():
+        return pending
+    import pandas as pd
+    df = pd.read_csv(lifecycle_path)
+    open_statuses = ["SUBMITTED", "PENDING", "PARTIALLY_FILLED"]
+    for _, row in df[df["status"].isin(open_statuses)].iterrows():
+        def _opt(col):
+            val = row.get(col)
+            if val is None or (isinstance(val, float) and val != val):  # NaN
+                return None
+            return str(val)
+        pending.append(Order(
+            order_id=row["order_id"], date=row["date"], ticker=row["ticker"],
+            action=Action(row["action"]), shares=row["shares"],
+            order_type=row.get("order_type", "MOO"),
+            stop_price=row.get("stop_price", 0),
+            target_price=row.get("target_price", 0),
+            status=OrderStatus(row["status"]), reason=row.get("reason", ""),
+            broker_order_id=_opt("broker_order_id"),
+            perm_id=_opt("perm_id"),
+        ))
+    return pending
+
 
 def check_duplicate(portfolio: Portfolio, today: str) -> bool:
     last = portfolio.get_state().get("last_updated", "")
@@ -673,49 +881,6 @@ def reset_sim_state(sim: Path = PORTFOLIO_STATE_FILE_SIM) -> list:
     return removed
 
 
-def _build_ibkr_order(order_row, today: str):
-    """Build an Order for IBKR submission with whole-share enforcement.
-
-    IBKR rejects fractional quantities, so shares are floored to a whole number
-    HERE -- before logging, pre-flight notional, and reconciliation -- so every
-    downstream consumer sees the same integer the broker receives. Returns the
-    Order, or None if the quantity floors below one share (logged and skipped).
-
-    Accepts a pandas Series or a plain dict (both support [] and .get()).
-    """
-    action = Action.BUY if order_row["action"] == "BUY" else Action.SELL
-    raw_shares = order_row["shares"]
-    shares = floor_shares_for_ibkr(raw_shares)
-    if shares < 1:
-        print(f"    SKIP {order_row['ticker']}: {float(raw_shares):.4f} shares floor to {shares} (< 1)")
-        return None
-    return Order.create(
-        date=today, ticker=order_row["ticker"], action=action,
-        shares=shares,
-        stop_price=order_row.get("stop_price", 0),
-        target_price=order_row.get("target_price", 0),
-        reason=order_row.get("reason", ""),
-        probability=order_row.get("probability", 0),
-    )
-
-
-def _has_pending_order(ticker: str, today: str) -> bool:
-    """Check orders_lifecycle.csv for existing SUBMITTED/PENDING order for same ticker+date."""
-    lifecycle_path = OUTPUT_DIR / "orders_lifecycle.csv"
-    if not lifecycle_path.exists():
-        return False
-    try:
-        import pandas as pd
-        df = pd.read_csv(lifecycle_path)
-        if "ticker" in df.columns and "date" in df.columns and "status" in df.columns:
-            match = df[(df["ticker"] == ticker) & (df["date"] == today) &
-                       (df["status"].isin(["SUBMITTED", "PENDING", "FILLED"]))]
-            return len(match) > 0
-    except Exception:
-        pass
-    return False
-
-
 def _save_and_report(portfolio: Portfolio, orders, predictions, today: str,
                      update_state: bool = True) -> None:
     print("\n[7/7] Saving state and generating report...")
@@ -747,6 +912,17 @@ def parse_args():
                        default="sim", help="Execution mode (default: sim)")
     parser.add_argument("--confirm-paper-orders", action="store_true",
                        help="Required flag to submit IBKR paper orders")
+    parser.add_argument("--market-hours", action="store_true",
+                       help="Submit immediate MKT orders (TIF=DAY) for running during "
+                            "regular trading hours (09:30-16:00 ET) instead of pre-market "
+                            "MOO orders. Changes the allowed submission window to RTH.")
+    parser.add_argument("--allow-stale-data", action="store_true",
+                       help="Override the stale-price guard and submit paper orders even "
+                            "when the latest bar is older than MAX_DATA_STALENESS_TRADING_DAYS.")
+    parser.add_argument("--force-resubmit", action="store_true",
+                       help="Re-run ibkr_paper the same day even if it already ran today. "
+                            "Safe: live broker open-order/holding checks prevent duplicate "
+                            "orders. Use after manually cancelling orders at the broker.")
     parser.add_argument("--reconcile-only", action="store_true",
                        help="Fetch fills from IBKR, update portfolio, no new orders")
     parser.add_argument("--override-time-check", action="store_true",
@@ -803,13 +979,15 @@ def main():
 
     log_run(args.mode, "START", f"mode={args.mode}")
 
+    order_type = "MKT" if args.market_hours else "MOO"
+
     try:
         if args.mode == "sim":
             run_sim(today)
         elif args.mode == "ibkr_dry_run":
-            run_ibkr_dry_run(today)
+            run_ibkr_dry_run(today, order_type, args.allow_stale_data)
         elif args.mode == "ibkr_paper":
-            run_ibkr_paper(today)
+            run_ibkr_paper(today, order_type, args.allow_stale_data, args.force_resubmit)
 
         log_run(args.mode, "COMPLETE", "success")
     except Exception as e:

@@ -54,8 +54,31 @@ class Portfolio:
             "starting_capital": starting_capital,
             "open_positions": {},
             "trade_history": [],
+            "processed_fill_ids": [],  # execIds already applied (idempotency)
             "last_updated": "",  # empty = never run before
         }
+
+    def is_fill_processed(self, fill_id: str) -> bool:
+        """True if this broker execution id has already been applied to state.
+
+        The processed set lives INSIDE the portfolio state so it is committed
+        atomically with positions/cash on save(). This makes --reconcile-only
+        idempotent and crash-safe: a fill is only ever marked processed in the
+        same atomic write that records its effect on the ledger.
+        """
+        if not fill_id:
+            return False
+        return fill_id in set(self.state.get("processed_fill_ids", []))
+
+    def mark_fill_processed(self, fill_id: str) -> None:
+        if not fill_id:
+            return
+        ids = self.state.setdefault("processed_fill_ids", [])
+        if fill_id not in ids:
+            ids.append(fill_id)
+            # Cap to avoid unbounded growth; keep most recent.
+            if len(ids) > MAX_TRADE_HISTORY * 5:
+                self.state["processed_fill_ids"] = ids[-MAX_TRADE_HISTORY * 5:]
 
     def save(self) -> None:
         """Atomic save: write to temp file, then rename."""
@@ -159,6 +182,86 @@ class Portfolio:
         self.state["cash"] += value - fee
         self.state["trade_history"].append(trade)
         del self.state["open_positions"][ticker]
+
+    def apply_buy_fill(self, ticker: str, shares: float, fill_price: float,
+                       commission: float, date: str,
+                       stop_price: float = 0.0, target_price: float = 0.0) -> None:
+        """Apply a confirmed IBKR BUY fill using the EXACT fill price + commission.
+
+        Unlike record_entry (which is for the simulated cost model), this does
+        not add slippage or recompute a fee — the broker already reported both.
+        Augments an existing position (averages in) so repeated partial fills
+        for the same ticker accumulate instead of being rejected.
+        """
+        if shares <= 0:
+            raise ValueError(f"Invalid shares: {shares}")
+        if fill_price <= 0:
+            raise ValueError(f"Invalid fill price: {fill_price}")
+
+        cost = shares * fill_price + commission
+        if cost > self.cash:
+            raise ValueError(f"Insufficient cash: need ${cost:.2f}, have ${self.cash:.2f}")
+
+        if ticker in self.open_positions:
+            pos = self.state["open_positions"][ticker]
+            total_shares = pos["shares"] + shares
+            pos["entry_price"] = (
+                pos["entry_price"] * pos["shares"] + fill_price * shares
+            ) / total_shares
+            pos["shares"] = total_shares
+            pos["entry_fee"] = pos.get("entry_fee", 0.0) + commission
+        else:
+            if len(self.open_positions) >= MAX_POSITIONS:
+                raise ValueError(f"Max positions ({MAX_POSITIONS}) reached")
+            self.state["open_positions"][ticker] = {
+                "shares": shares,
+                "entry_price": fill_price,
+                "entry_date": date,
+                "stop_price": stop_price,
+                "target_price": target_price,
+                "entry_fee": commission,
+            }
+        self.state["cash"] -= cost
+
+    def apply_sell_fill(self, ticker: str, shares: float, fill_price: float,
+                        commission: float, date: str,
+                        reason: str = "ibkr_fill") -> None:
+        """Apply a confirmed IBKR SELL fill using the EXACT fill price + commission.
+
+        Handles partial sells: reduces the position by the filled quantity and
+        only removes it (and books the full trade) once shares reach zero.
+        """
+        if ticker not in self.open_positions:
+            raise ValueError(f"Not holding {ticker}")
+
+        pos = self.state["open_positions"][ticker]
+        sell_shares = min(shares, pos["shares"])
+        if sell_shares <= 0:
+            raise ValueError(f"Invalid sell shares: {shares}")
+
+        value = sell_shares * fill_price
+        # Allocate a proportional slice of the entry fee to the sold shares.
+        entry_fee_slice = pos.get("entry_fee", 0.0) * (sell_shares / pos["shares"])
+        pnl = (fill_price - pos["entry_price"]) * sell_shares - commission - entry_fee_slice
+
+        self.state["cash"] += value - commission
+        self.state["trade_history"].append({
+            "ticker": ticker,
+            "entry_date": pos.get("entry_date", ""),
+            "exit_date": date,
+            "entry_price": pos["entry_price"],
+            "exit_price": fill_price,
+            "shares": sell_shares,
+            "pnl": round(pnl, 2),
+            "return_pct": round(fill_price / pos["entry_price"] - 1, 6),
+            "reason": reason,
+        })
+
+        if sell_shares >= pos["shares"]:
+            del self.state["open_positions"][ticker]
+        else:
+            pos["shares"] -= sell_shares
+            pos["entry_fee"] = pos.get("entry_fee", 0.0) - entry_fee_slice
 
     def check_exits(self, today: str) -> list[str]:
         """Return tickers that should be exited (max hold exceeded)."""

@@ -7,3 +7,4 @@ matplotlib
 joblib
 yfinance
 ib_insync
+pandas_market_calendars

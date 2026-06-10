@@ -32,11 +32,11 @@ BackTester is a quantitative trading research and execution system. It started a
 
 - **Single daily command.** `python run_daily.py` downloads data, computes features, generates predictions, ranks candidates, sizes positions, and produces orders.
 
-- **Three execution modes.** `sim` (simulated fills), `ibkr_dry_run` (connect IBKR, log intended orders, submit nothing), `ibkr_paper` (submit MOO orders to IBKR paper account).
+- **Three execution modes.** `sim` (simulated fills), `ibkr_dry_run` (connect IBKR, log intended orders, submit nothing), `ibkr_paper` (submit live orders to the IBKR paper account). By default orders are pre-market MOO (market-on-open); `--market-hours` submits immediate MKT orders during regular trading hours instead.
 
-- **IBKR paper trading integration.** Paper-only port (4002) hardcoded. Account prefix verification. Pre-flight checks compare local vs broker state. Duplicate order protection. MOO (market-on-open) orders only.
+- **IBKR paper trading integration.** Paper-only port (4002) hardcoded. Account prefix verification. The strategy runs as a configured sub-allocation (`IBKR_PAPER_STRATEGY_CAPITAL`) inside the larger paper account, so pre-flight uses a one-sided equity guard (broker ≥ local) plus buying-power sufficiency rather than requiring equal balances; local positions must be backed at the broker (unrelated broker holdings only warn). All orders are whole shares (fractional floored). A stale-price guard blocks submission if the latest bar is older than a configurable number of NYSE trading sessions. Duplicate order protection.
 
-- **Order lifecycle management.** SIGNAL -> PENDING -> SUBMITTED -> FILLED/CANCELLED/REJECTED. Portfolio state updated only from confirmed fills via FillReconciler. Atomic JSON saves with backup.
+- **Order lifecycle management.** SIGNAL -> PENDING -> SUBMITTED -> FILLED/PARTIALLY_FILLED/CANCELLED/REJECTED. Fills are matched to orders on IBKR's stable `perm_id`, applied at the exact broker price/commission (partial fills accumulated), and portfolio state is updated only from confirmed fills. Reconciliation is idempotent and crash-safe — re-running it never double-counts. Atomic JSON saves with backup.
 
 ## What it is not
 
@@ -44,7 +44,7 @@ BackTester is a quantitative trading research and execution system. It started a
 
 - **Not a data provider.** Downloads historical data via yfinance. Does not stream real-time data.
 
-- **Not a high-frequency system.** Operates on daily bars. Signals generated after close, orders submitted before open. No intraday logic.
+- **Not a high-frequency system.** Operates on daily bars. Signals are generated from the previous close; orders are submitted pre-market (MOO) or, with `--market-hours`, as immediate market orders during regular hours. There is no intraday signal logic — the decision is still one daily-bar signal per name.
 
 - **Not a portfolio optimizer.** Runs a single pre-committed configuration. Does not search parameter space or do walk-forward optimization.
 

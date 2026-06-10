@@ -20,10 +20,10 @@ using json = nlohmann::json;
 using response = cpr::Response;
 
 int main() {
-	int opt = 1;
+	/*int opt = 1;
 	std::string ticker = "AAPL";
 	std::string rr_ticker = "RR";
-	Regimes regime{Regimes::MODERN};
+	Regimes regime{Regimes::MODERN};*/
 
 	// Portfolio risk controls:
 	// - risk_per_trade = 0.01 risks about 1% of portfolio value if the stop is hit.
@@ -35,7 +35,7 @@ int main() {
 	int max_open_positions = 5;
 	// Strategy setup:
 	// MomentumStrategy(20) compares recent price action against a 20-day lookback.
-	MomentumStrategy strat(20);
+//	MomentumStrategy strat(20);
 	//FixedPriceStrategy strat(2.30, 2.75);
 
 	// Swing trade management:
@@ -47,25 +47,25 @@ int main() {
 	double stop_loss_pct = 0.05;
 	double target_profit_pct = 0.10;
 
-	std::cout << "Running true multi-stock swing backtest for " << ticker << " and " << rr_ticker << "\n";
+	/*std::cout << "Running true multi-stock swing backtest for " << ticker << " and " << rr_ticker << "\n";
 	std::cout << "Starting cash: " << starting_cash << "\n";
 	std::cout << "Risk per trade: " << risk_per_trade * 100.0 << "%\n";
 	std::cout << "Max position fraction: " << max_position_fraction * 100.0 << "%\n";
 	std::cout << "Max open positions: " << max_open_positions << "\n";
 	std::cout << "Regime: MODERN (2020-01-01 to 2026-05-31)\n";
-	std::cout << "Stop loss: " << stop_loss_pct * 100.0 << "%, target: " << target_profit_pct * 100.0 << "%, max hold: " << max_hold_days << " days\n";
+	std::cout << "Stop loss: " << stop_loss_pct * 100.0 << "%, target: " << target_profit_pct * 100.0 << "%, max hold: " << max_hold_days << " days\n";*/
 
 	// True multi-stock backtest:
 	// MultiAssetBacktest builds one shared calendar across all tickers and records
 	// one portfolio equity value per date.
-	Portfolio multi_portfolio(starting_cash, risk_per_trade, max_position_fraction, max_open_positions);
+	/*Portfolio multi_portfolio(starting_cash, risk_per_trade, max_position_fraction, max_open_positions);
 	MultiAssetBacktest multi({ ticker, rr_ticker }, multi_portfolio);
 	multi.run_with_strategy(strat, regime, max_hold_days, stop_loss_pct, target_profit_pct);
 	Metrics multi_metrics(multi.get_equity_curve());
 	multi_metrics.print_metrics(multi.get_equity_curve());
 	TradeMetrics::print(multi.get_portfolio().get_trades());
 	std::cout << "Closed trades: " << multi.get_portfolio().get_trades().size() << "\n";
-	TradeMetrics::save_csv(multi.get_portfolio().get_trades(), "output/trades.csv");
+	*///TradeMetrics::save_csv(multi.get_portfolio().get_trades(), "output/trades.csv");
 
 	// ML dataset export for all tickers in ticker_data/universe.txt.
 	// Exports both label_target_stop and label_median_return per row.

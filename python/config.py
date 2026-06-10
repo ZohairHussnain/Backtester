@@ -78,43 +78,18 @@ THRESHOLD = 0.60
 TOP_N = 5
 MAX_POSITIONS = 10
 STARTING_CAPITAL = 10000.0
+
+# IBKR paper trading runs the strategy as a SUB-ALLOCATION inside a much larger
+# IBKR paper account (auto-funded at ~$1M+). The strategy must size off this
+# capital, NOT the full broker balance. Local portfolio_state.paper.json is the
+# strategy's own cash-envelope ledger; broker NetLiquidation includes unrelated
+# funds. Pre-flight therefore does NOT require broker == local equity.
+IBKR_PAPER_STRATEGY_CAPITAL = 10000.0
 RISK_PER_TRADE = 0.004      # position size = equity * (RISK_PER_TRADE / STOP_LOSS_PCT) = ~8% of equity
 MAX_POSITION_FRAC = 0.30    # per-order cash cap; loose enough to fill the 10th position as cash depletes
 STOP_LOSS_PCT = 0.05
 TARGET_PROFIT_PCT = 0.10
 MAX_HOLD_DAYS = 20
-
-# ---------------------------------------------------------------------------
-# IBKR paper trading
-# ---------------------------------------------------------------------------
-
-# The IBKR paper account is funded far above what this strategy should trade
-# (e.g. ~$1,000,000). The strategy ledger (portfolio_state.paper.json) is sized
-# independently from the broker balance: we use the broker ONLY for execution
-# and position verification, never to size positions off the full account.
-IBKR_PAPER_STRATEGY_CAPITAL = 10000.0
-
-# Pre-flight commits at most this fraction of broker available funds. Acts as a
-# buying-power sufficiency gate (not an equity-equality gate).
-IBKR_BUYING_POWER_SAFETY_FRAC = 0.95
-
-# IBKR rejects fractional share orders, so every IBKR-bound order is floored to
-# a whole number and dropped if it rounds below one share.
-ALLOW_FRACTIONAL_IBKR = False
-
-
-def floor_shares_for_ibkr(shares: float) -> int:
-    """Floor a (possibly fractional) share count to whole shares for IBKR.
-
-    Single source of truth for integer-share enforcement. Returns 0 for any
-    quantity that rounds below one share so the caller can skip the order.
-    Negative inputs clamp to 0 (no shorting via sizing bugs).
-    """
-    import math
-    if shares != shares or shares <= 0:  # NaN or non-positive
-        return 0
-    return int(math.floor(shares))
-
 
 # ---------------------------------------------------------------------------
 # Execution
@@ -131,3 +106,13 @@ FEE_CAP_PCT = 0.01
 
 MAX_PORTFOLIO_RISK_PCT = 0.02
 DRY_RUN = True
+
+# Maximum age (in TRADING SESSIONS) of the latest price bar the pipeline trades
+# on. Counted as NYSE sessions strictly after the latest bar up to and including
+# today, so weekends never inflate it (a Friday bar read Monday = 1 session) and
+# market holidays are excluded when pandas_market_calendars is installed
+# (weekday-only fallback otherwise). If the freshest bar is older than this, the
+# daily price update likely failed (yfinance down / network) and ibkr_paper
+# submission is blocked. 3 sessions tolerates a one-session data delay plus a
+# normal lag. Override a single run with --allow-stale-data.
+MAX_DATA_STALENESS_TRADING_DAYS = 3

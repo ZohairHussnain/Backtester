@@ -41,16 +41,18 @@ class Order:
     fill_price: Optional[float] = None
     fill_shares: Optional[float] = None
     broker_order_id: Optional[str] = None
+    perm_id: Optional[str] = None
     entry_fee: float = 0.0
 
     @staticmethod
     def create(date: str, ticker: str, action: Action, shares: float,
                stop_price: float, target_price: float, reason: str,
-               probability: float = 0.0, rank: int = 0) -> "Order":
+               probability: float = 0.0, rank: int = 0,
+               order_type: str = "MOO") -> "Order":
         return Order(
             order_id=str(uuid.uuid4())[:8],
             date=date, ticker=ticker, action=action, shares=shares,
-            order_type="MOO", stop_price=stop_price, target_price=target_price,
+            order_type=order_type, stop_price=stop_price, target_price=target_price,
             status=OrderStatus.PENDING, reason=reason,
             probability=probability, rank=rank,
             created_at=datetime.now().isoformat(),
@@ -66,7 +68,8 @@ class Order:
             "rank": self.rank, "created_at": self.created_at,
             "submitted_at": self.submitted_at, "filled_at": self.filled_at,
             "fill_price": self.fill_price, "fill_shares": self.fill_shares,
-            "broker_order_id": self.broker_order_id, "entry_fee": self.entry_fee,
+            "broker_order_id": self.broker_order_id, "perm_id": self.perm_id,
+            "entry_fee": self.entry_fee,
         }
 
 

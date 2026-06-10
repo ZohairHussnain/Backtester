@@ -1,17 +1,19 @@
 """FillReconciler: match broker fills to orders, produce Fill records.
 
-Join key: a broker fill is matched to one of our orders by BROKER order id
-(IBKR's execution.orderId == Order.broker_order_id), NOT the internal uuid
-order_id. Matching on the internal id can never succeed and silently drops
-every fill.
+Matching strategy (stable broker ids ONLY), because IBKR's per-session orderId
+is unreliable (often 0 for executions queried in a later API session):
+  1. perm_id        — IBKR's stable cross-session order id
+  2. broker_order_id — the orderId captured at submit time
 
-Idempotency: already-processed executions are identified by their broker
-execution id (fill_id) recorded in the fills log. Re-running reconciliation is
-a safe no-op -- a fill is applied at most once.
+There is deliberately NO ticker/action fallback: ib.fills() returns the whole
+account execution history (including fills from earlier runs), so matching by
+ticker would attach a stale same-ticker fill to a freshly submitted order.
 
-Partial fills: a single order may fill across several executions. Order status
-is FILLED only once cumulative filled shares (across all runs, read back from
-the fills log) reach the ordered quantity; otherwise PARTIALLY_FILLED.
+Idempotency is NOT owned here. The reconciler only de-duplicates identical
+execution ids WITHIN a single fetch. Cross-run idempotency is owned by the
+Portfolio (processed_fill_ids, committed atomically with state), so a crash can
+never leave a fill marked "seen" but unapplied. Callers must apply fills, save
+the portfolio, and only then call log_fills() to append the audit record.
 """
 
 import csv
@@ -25,104 +27,77 @@ class FillReconciler:
     def __init__(self, fills_log_path: Path = None):
         self.log_path = fills_log_path
 
-    # ------------------------------------------------------------------
-    # Reconciliation
-    # ------------------------------------------------------------------
+    def _match_order(self, bf: dict, pending_orders: list[Order]) -> Optional[Order]:
+        """Find the local Order a broker fill belongs to."""
+        perm_id = str(bf.get("perm_id") or "")
+        order_id = str(bf.get("order_id") or "")
+
+        # Match ONLY on stable broker ids. ib.fills() returns the account's whole
+        # recent execution history (including fills from previous runs), so a
+        # loose ticker/action fallback would wrongly attach a stale same-ticker
+        # fill to a freshly submitted order. perm_id (and the submit-time
+        # broker_order_id) uniquely identify our own orders; nothing else may.
+        if perm_id:
+            for o in pending_orders:
+                if o.perm_id and str(o.perm_id) == perm_id:
+                    return o
+        if order_id and order_id != "0":
+            for o in pending_orders:
+                if o.broker_order_id and str(o.broker_order_id) == order_id:
+                    return o
+        return None
 
     def reconcile(self, broker_fills: list[dict],
                   pending_orders: list[Order]) -> list[Fill]:
-        """Match broker fills to orders. Returns only NEW (unseen) Fill objects.
+        """Match broker fills to orders. Returns confirmed Fill objects.
 
-        Fills whose broker order id matches none of pending_orders are reported
-        as unexpected and skipped (never applied to the portfolio). Fills whose
-        execution id was already processed are skipped (idempotent).
+        - De-duplicates identical execution ids within this fetch.
+        - Accumulates multiple executions against one order (partial fills):
+          an order is FILLED only once cumulative shares >= order.shares.
+        Does NOT write any log or mutate any ledger.
         """
-        # Index our orders by the real broker join key.
-        order_map: dict[str, Order] = {}
-        for o in pending_orders:
-            if o.broker_order_id:
-                order_map[str(o.broker_order_id)] = o
-
-        seen_fill_ids, cum_by_order_id = self._load_processed()
-
-        new_fills: list[Fill] = []
-        new_shares_by_order_id: dict[str, float] = {}
+        fills = []
+        seen_in_batch = set()
+        cumulative = {id(o): 0.0 for o in pending_orders}
 
         for bf in broker_fills:
-            fill_id = str(bf.get("fill_id", ""))
-            if not fill_id:
-                print("  WARNING: broker fill with no execution id -- skipping")
+            fill_id = bf.get("fill_id", "")
+            if fill_id and fill_id in seen_in_batch:
                 continue
-            if fill_id in seen_fill_ids:
-                continue  # already applied -- idempotent skip
 
-            broker_id = str(bf.get("order_id", ""))
-            order = order_map.get(broker_id)
+            order = self._match_order(bf, pending_orders)
             if order is None:
-                print(f"  WARNING: Unexpected fill {fill_id} for broker order "
-                      f"{broker_id} (not one of ours) -- skipping")
+                print(f"  WARNING: Unmatched fill {fill_id} "
+                      f"({bf.get('action')} {bf.get('ticker')}) -- skipping")
                 continue
 
-            # Trust our own order's action; IBKR reports side as BOT/SLD which
-            # is not a valid Action value.
             fill = Fill(
                 fill_id=fill_id,
                 order_id=order.order_id,
                 ticker=bf.get("ticker", order.ticker),
-                action=order.action,
-                shares_filled=float(bf.get("shares_filled", order.shares)),
-                fill_price=float(bf.get("fill_price", 0) or 0),
-                commission=float(bf.get("commission", 0) or 0),
+                action=Action(bf.get("action", order.action.value)),
+                shares_filled=bf.get("shares_filled", order.shares),
+                fill_price=bf.get("fill_price", 0),
+                commission=bf.get("commission", 0),
                 filled_at=bf.get("filled_at", ""),
             )
-            new_fills.append(fill)
-            seen_fill_ids.add(fill_id)
-            new_shares_by_order_id[order.order_id] = (
-                new_shares_by_order_id.get(order.order_id, 0.0) + fill.shares_filled)
+            fills.append(fill)
+            if fill_id:
+                seen_in_batch.add(fill_id)
 
-        # Update order status from cumulative filled shares (prior runs + this).
-        for order in order_map.values():
-            filled = (cum_by_order_id.get(order.order_id, 0.0)
-                      + new_shares_by_order_id.get(order.order_id, 0.0))
-            if filled <= 0:
-                continue
-            order.filled_at = new_fills[-1].filled_at if new_fills else order.filled_at
-            if filled >= order.shares:
+            cumulative[id(order)] += fill.shares_filled
+            if cumulative[id(order)] >= order.shares:
                 order.status = OrderStatus.FILLED
             else:
                 order.status = OrderStatus.PARTIALLY_FILLED
+            order.filled_at = fill.filled_at
+            order.fill_price = fill.fill_price
+            order.fill_shares = cumulative[id(order)]
 
-        self.log_fills(new_fills)
-        return new_fills
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-
-    def _load_processed(self) -> tuple[set, dict]:
-        """Read the fills log: set of seen execution ids and cumulative filled
-        shares per internal order_id. Empty if the log does not exist yet."""
-        seen: set = set()
-        cum: dict = {}
-        if not self.log_path or not Path(self.log_path).exists():
-            return seen, cum
-        try:
-            with open(self.log_path, newline="") as f:
-                for row in csv.DictReader(f):
-                    fid = str(row.get("fill_id", ""))
-                    if fid:
-                        seen.add(fid)
-                    oid = str(row.get("order_id", ""))
-                    try:
-                        cum[oid] = cum.get(oid, 0.0) + float(row.get("shares_filled", 0) or 0)
-                    except (TypeError, ValueError):
-                        pass
-        except Exception as e:
-            print(f"  WARNING: could not read fills log {self.log_path} ({e}); "
-                  f"treating as empty (may risk re-applying fills).")
-        return seen, cum
+        return fills
 
     def log_fills(self, fills: list[Fill]) -> None:
+        """Append fills to the audit log. Call AFTER the portfolio is saved."""
         if not self.log_path or not fills:
             return
         self.log_path.parent.mkdir(parents=True, exist_ok=True)

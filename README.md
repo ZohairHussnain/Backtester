@@ -37,12 +37,12 @@ A single daily command runs the whole flow:
 
 ### 4. Execution / Broker Architecture (`python/execution/`)
 
-- `order.py` — `Order`, `Fill`, `OrderStatus`, `Action`
+- `order.py` — `Order`, `Fill`, `OrderStatus`, `Action` (orders carry `broker_order_id` + `perm_id`)
 - `order_manager.py` — signal-to-order conversion with lifecycle tracking
 - `broker_adapter.py` — abstract `BrokerAdapter` + `SimulatedBroker`
-- `ibkr_broker.py` — paper-only IBKR via `ib_insync` (port 4002 hardcoded, paper account verified)
-- `fill_reconciler.py` — matches broker fills to orders, handles partials
-- `portfolio_manager.py` — state updated **only** from confirmed fills
+- `ibkr_broker.py` — paper-only IBKR via `ib_insync` (port 4002 hardcoded, paper account verified, integer shares, MOO or MKT)
+- `fill_reconciler.py` — matches broker fills to orders on stable `perm_id` (falls back to `broker_order_id`, then ticker+action); accumulates partial fills
+- `portfolio.py` / `portfolio_manager.py` — state updated **only** from confirmed fills, at the exact broker price/commission; reconciliation is idempotent and crash-safe (`processed_fill_ids` committed atomically)
 
 ## Requirements
 
@@ -52,7 +52,7 @@ A single daily command runs the whole flow:
 
 **Python:**
 - Python 3.10+
-- `pip install -r python/requirements.txt` (pandas, numpy, scikit-learn, xgboost, lightgbm, joblib, yfinance, ib_insync)
+- `pip install -r python/requirements.txt` (pandas, numpy, scikit-learn, xgboost, lightgbm, joblib, yfinance, ib_insync, pandas_market_calendars)
 - For paper trading: IBKR Gateway running in paper mode with the API enabled on port 4002
 
 ## Build & Run (C++)
@@ -84,8 +84,9 @@ python walk_forward_train.py
 # Daily production pipeline
 python run_daily.py                                           # sim mode (default)
 python run_daily.py --mode ibkr_dry_run                       # connect IBKR, log orders, no submission
-python run_daily.py --mode ibkr_paper --confirm-paper-orders  # submit MOO to IBKR paper
-python run_daily.py --reconcile-only                          # fetch fills, update state
+python run_daily.py --mode ibkr_paper --confirm-paper-orders  # submit pre-market MOO to IBKR paper
+python run_daily.py --mode ibkr_paper --confirm-paper-orders --market-hours  # immediate MKT orders during RTH
+python run_daily.py --reconcile-only                          # fetch fills, update state (idempotent)
 
 # Download / update price data
 python download_data.py           # default tickers
@@ -93,6 +94,10 @@ python expand_universe.py         # 101-stock universe
 
 # IBKR connection test (places no orders)
 python test_ibkr_connection.py
+
+# Python test suites (zero-dependency assert harness)
+python test_state_isolation.py    # sim/paper state isolation, migration, reset
+python test_ibkr_execution.py     # preflight, integer shares, reconciliation, stale-price guard
 ```
 
 ## Signal Timing (critical for correctness)
@@ -111,12 +116,16 @@ All paths: signal from the previous bar, entry at the current bar open. Verified
 - Entry timing: signal from bar D, entry at bar D+1 open (matches LabelEngine)
 - No look-ahead bias (audited multiple times)
 - Walk-forward purge removes the last 20 trading rows per ticker before each test year
-- Portfolio state updated only from confirmed fills (not from orders or signals)
+- Portfolio state updated only from confirmed fills (not from orders or signals), at the exact broker price/commission
+- Reconciliation matches on stable `perm_id`, accumulates partial fills, and is idempotent + crash-safe (re-running `--reconcile-only` never double-counts)
 - IBKR paper port (4002) hardcoded; live port blocked at import time
 - Atomic portfolio saves with backup and corrupt-file recovery
 - `ibkr_paper` requires `--confirm-paper-orders`
-- MOO orders blocked outside 04:00–09:25 ET (requires two override flags)
-- Pre-flight checks compare local vs broker equity and positions before submission
+- Orders blocked outside their submission window (04:00–09:25 ET for MOO, 09:30–16:00 ET for `--market-hours` MKT) unless two override flags are passed
+- Strategy sizes off a configured sub-allocation (`IBKR_PAPER_STRATEGY_CAPITAL`), not the full paper-account balance
+- Pre-flight: one-sided equity guard (broker ≥ local) + buying-power sufficiency + position backing; unrelated broker holdings warn, never block
+- All IBKR orders are whole shares (fractional floored, sub-1 skipped)
+- Stale-price guard blocks `ibkr_paper` when the latest bar is older than `MAX_DATA_STALENESS_TRADING_DAYS` NYSE sessions (override with `--allow-stale-data`)
 
 ## Current Performance (research, not live)
 
