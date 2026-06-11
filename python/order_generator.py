@@ -21,8 +21,11 @@ class OrderGenerator:
 
     def generate_orders(self, predictions: pd.DataFrame,
                         portfolio_state: dict,
-                        exit_tickers: list[str] = None) -> pd.DataFrame:
+                        exit_tickers=None) -> pd.DataFrame:
         """Generate entry and exit orders.
+
+        exit_tickers may be a {ticker: reason} dict (from determine_exits) or a
+        plain list of tickers (legacy; defaults the reason to "max_hold_exit").
 
         Returns DataFrame with columns:
             date, ticker, probability, rank, action, shares,
@@ -31,8 +34,14 @@ class OrderGenerator:
         orders = []
         today = predictions["date"].max() if len(predictions) > 0 else ""
 
+        # Normalize to {ticker: reason}.
+        if isinstance(exit_tickers, dict):
+            exit_reasons = dict(exit_tickers)
+        else:
+            exit_reasons = {t: "max_hold_exit" for t in (exit_tickers or [])}
+
         # --- Exit orders ---
-        for ticker in (exit_tickers or []):
+        for ticker, reason in exit_reasons.items():
             pos = portfolio_state.get("open_positions", {}).get(ticker)
             if pos:
                 orders.append({
@@ -40,13 +49,13 @@ class OrderGenerator:
                     "rank": None, "action": "SELL",
                     "shares": pos["shares"], "entry_type": "MOO",
                     "stop_price": None, "target_price": None,
-                    "reason": "max_hold_exit",
+                    "reason": reason,
                 })
 
         # --- Entry orders ---
         open_positions = portfolio_state.get("open_positions", {})
         # Count positions that will remain after exits
-        valid_exits = [t for t in (exit_tickers or []) if t in open_positions]
+        valid_exits = [t for t in exit_reasons if t in open_positions]
         n_remaining = len(open_positions) - len(valid_exits)
         slots_available = self.max_positions - max(n_remaining, 0)
 

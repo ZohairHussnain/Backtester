@@ -58,10 +58,34 @@ class FakeBroker:
         return self._open_orders
 
 
+class FakeReconcileBroker:
+    """Connected broker that reports no new fills (for reconcile-only tests)."""
+    _connected = True
+
+    def get_fills(self):
+        return []
+
+    def disconnect(self):
+        pass
+
+
 def _fake_prices(price):
     """Return a load_prices-compatible frame whose last close is `price`."""
     def _loader(ticker):
         return pd.DataFrame({"close": [price]})
+    return _loader
+
+
+def _fake_bars(bars):
+    """Return a load_prices loader yielding the given OHLC bars.
+
+    `bars` is a list of (date, open, high, low) tuples. Close defaults to open.
+    """
+    def _loader(ticker):
+        return pd.DataFrame([
+            {"date": d, "open": o, "high": h, "low": l, "close": o}
+            for (d, o, h, l) in bars
+        ])
     return _loader
 
 
@@ -500,6 +524,174 @@ def test_unparseable_date_does_not_block():
 
 
 # ---------------------------------------------------------------------------
+# Phase B: stop/target exit levels + daily-check exits
+# ---------------------------------------------------------------------------
+
+def test_buy_fill_derives_stop_and_target():
+    print("\n[B1] a BUY fill stamps stop/target from the fill price")
+    p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+    p.apply_buy_fill("AAA", 10, 100.0, 1.0, "2026-06-10")
+    pos = p.open_positions["AAA"]
+    check(abs(pos["stop_price"] - 95.0) < 1e-6, "stop = entry * (1 - 0.05) = 95.0")
+    check(abs(pos["target_price"] - 110.0) < 1e-6, "target = entry * (1 + 0.10) = 110.0")
+
+
+def test_partial_buy_reblends_stop_target():
+    print("\n[B2] averaging-in re-derives stop/target off the blended entry")
+    p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+    p.apply_buy_fill("AAA", 6, 50.0, 1.0, "2026-06-10")
+    p.apply_buy_fill("AAA", 4, 52.0, 1.0, "2026-06-10")  # blended entry = 50.8
+    pos = p.open_positions["AAA"]
+    check(abs(pos["entry_price"] - 50.8) < 1e-9, "blended entry is 50.8")
+    check(abs(pos["stop_price"] - 50.8 * 0.95) < 1e-6, "stop re-derived off blended entry")
+    check(abs(pos["target_price"] - 50.8 * 1.10) < 1e-6, "target re-derived off blended entry")
+
+
+def test_backfill_exit_levels():
+    print("\n[B3] backfill_exit_levels fills legacy zero stop/target from entry")
+    p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+    p.get_state()["open_positions"]["OLD"] = {
+        "shares": 5, "entry_price": 200.0, "entry_date": "2026-06-01",
+        "stop_price": 0.0, "target_price": 0.0, "entry_fee": 1.0,
+    }
+    updated = p.backfill_exit_levels()
+    check(updated == ["OLD"], "OLD reported as backfilled")
+    pos = p.open_positions["OLD"]
+    check(abs(pos["stop_price"] - 190.0) < 1e-6, "stop backfilled to 200*0.95=190")
+    check(abs(pos["target_price"] - 220.0) < 1e-6, "target backfilled to 200*1.10=220")
+    # Idempotent: a second pass finds nothing to do.
+    check(p.backfill_exit_levels() == [], "second backfill is a no-op")
+
+
+def test_determine_exits_stop_hit():
+    print("\n[B4] determine_exits flags a stop when a bar low pierces it")
+    saved = run_daily.load_prices
+    try:
+        p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+        p.apply_buy_fill("AAA", 10, 100.0, 1.0, "2026-06-10")  # stop 95, target 110
+        run_daily.load_prices = _fake_bars([("2026-06-11", 99.0, 100.0, 94.0)])
+        exits = run_daily.determine_exits(p, "2026-06-11")
+        check(exits.get("AAA") == "stop_hit", "low 94 <= stop 95 -> stop_hit")
+    finally:
+        run_daily.load_prices = saved
+
+
+def test_determine_exits_target_hit():
+    print("\n[B5] determine_exits flags a target when a bar high reaches it")
+    saved = run_daily.load_prices
+    try:
+        p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+        p.apply_buy_fill("AAA", 10, 100.0, 1.0, "2026-06-10")  # stop 95, target 110
+        run_daily.load_prices = _fake_bars([("2026-06-11", 101.0, 111.0, 100.0)])
+        exits = run_daily.determine_exits(p, "2026-06-11")
+        check(exits.get("AAA") == "target_hit", "high 111 >= target 110 -> target_hit")
+    finally:
+        run_daily.load_prices = saved
+
+
+def test_determine_exits_tie_break_stop_wins():
+    print("\n[B6] same-bar stop+target ties break by open distance (stop on exact tie)")
+    saved = run_daily.load_prices
+    try:
+        p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+        p.apply_buy_fill("AAA", 10, 100.0, 1.0, "2026-06-10")  # stop 95, target 110
+        # Bar trips BOTH (low<=95 and high>=110). Open 96 is closer to stop.
+        run_daily.load_prices = _fake_bars([("2026-06-11", 96.0, 111.0, 94.0)])
+        check(run_daily.determine_exits(p, "2026-06-11").get("AAA") == "stop_hit",
+              "open 96 closer to stop -> stop_hit")
+        # Open 109 is closer to target.
+        run_daily.load_prices = _fake_bars([("2026-06-11", 109.0, 111.0, 94.0)])
+        check(run_daily.determine_exits(p, "2026-06-11").get("AAA") == "target_hit",
+              "open 109 closer to target -> target_hit")
+        # Exact tie (open equidistant) -> stop wins.
+        run_daily.load_prices = _fake_bars([("2026-06-11", 102.5, 111.0, 94.0)])
+        check(run_daily.determine_exits(p, "2026-06-11").get("AAA") == "stop_hit",
+              "equidistant open -> stop wins the tie")
+    finally:
+        run_daily.load_prices = saved
+
+
+def test_determine_exits_skips_entry_bar():
+    print("\n[B7] the entry bar itself never triggers an exit (D+1 onward)")
+    saved = run_daily.load_prices
+    try:
+        p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+        p.apply_buy_fill("AAA", 10, 100.0, 1.0, "2026-06-10")  # stop 95
+        # A piercing bar dated on the ENTRY day must be ignored.
+        run_daily.load_prices = _fake_bars([("2026-06-10", 96.0, 100.0, 90.0)])
+        exits = run_daily.determine_exits(p, "2026-06-10")
+        check("AAA" not in exits, "entry-day bar does not trigger an exit")
+    finally:
+        run_daily.load_prices = saved
+
+
+def test_determine_exits_max_hold_fallback():
+    print("\n[B8] no price hit but past max-hold -> max_hold_exit")
+    saved = run_daily.load_prices
+    try:
+        p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+        p.apply_buy_fill("AAA", 1, 100.0, 1.0, "2026-05-01")  # >20 cal days before today
+        run_daily.load_prices = _fake_bars([("2026-05-04", 100.0, 101.0, 99.0)])  # no hit
+        exits = run_daily.determine_exits(p, "2026-06-10")
+        check(exits.get("AAA") == "max_hold_exit", "held > 20 days -> max_hold_exit")
+    finally:
+        run_daily.load_prices = saved
+
+
+def test_determine_exits_no_exit():
+    print("\n[B9] fresh position, no price hit -> no exit")
+    saved = run_daily.load_prices
+    try:
+        p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+        p.apply_buy_fill("AAA", 10, 100.0, 1.0, "2026-06-10")
+        run_daily.load_prices = _fake_bars([("2026-06-11", 100.0, 101.0, 99.0)])
+        exits = run_daily.determine_exits(p, "2026-06-11")
+        check("AAA" not in exits, "no stop/target hit and within max-hold -> no exit")
+    finally:
+        run_daily.load_prices = saved
+
+
+def test_exit_order_carries_reason():
+    print("\n[B10] order_generator threads the exit reason into the SELL order")
+    from order_generator import OrderGenerator
+    preds = pd.DataFrame({"date": ["2026-06-11"], "ticker": ["ZZZ"], "probability": [0.1]})
+    state = {"cash": 1000.0, "open_positions": {
+        "AAA": {"shares": 10, "entry_price": 100.0, "entry_date": "2026-06-10",
+                "stop_price": 95.0, "target_price": 110.0, "entry_fee": 1.0}}}
+    orders = OrderGenerator().generate_orders(preds, state, {"AAA": "stop_hit"})
+    sells = orders[orders["action"] == "SELL"]
+    check(len(sells) == 1, "one SELL order generated for the exit")
+    check(sells.iloc[0]["reason"] == "stop_hit", "SELL order reason == stop_hit")
+    # Legacy list input still works and defaults the reason.
+    orders2 = OrderGenerator().generate_orders(preds, state, ["AAA"])
+    check(orders2[orders2["action"] == "SELL"].iloc[0]["reason"] == "max_hold_exit",
+          "list input defaults reason to max_hold_exit")
+
+
+def test_reconcile_only_backfills_legacy_levels():
+    print("\n[B11] --reconcile-only backfills legacy zero stop/target and saves")
+    saved_broker = run_daily.create_broker
+    saved_paper = run_daily.PORTFOLIO_STATE_FILE_PAPER
+    with tempfile.TemporaryDirectory() as d:
+        state = Path(d) / "portfolio_state.paper.json"
+        p = Portfolio(state, 10000.0)
+        p.get_state()["open_positions"]["OLD"] = {
+            "shares": 5, "entry_price": 200.0, "entry_date": "2026-06-01",
+            "stop_price": 0.0, "target_price": 0.0, "entry_fee": 1.0}
+        p.save()
+        try:
+            run_daily.PORTFOLIO_STATE_FILE_PAPER = state
+            run_daily.create_broker = lambda mode: FakeReconcileBroker()
+            run_daily.run_reconcile_only("2026-06-11")
+        finally:
+            run_daily.create_broker = saved_broker
+            run_daily.PORTFOLIO_STATE_FILE_PAPER = saved_paper
+        pos = Portfolio(state, 10000.0).open_positions["OLD"]
+        check(abs(pos["stop_price"] - 190.0) < 1e-6, "reconcile-only persisted stop=190")
+        check(abs(pos["target_price"] - 220.0) < 1e-6, "reconcile-only persisted target=220")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -538,6 +730,17 @@ def main():
     test_stale_data_warns_only_in_sim()
     test_allow_stale_override()
     test_unparseable_date_does_not_block()
+    test_buy_fill_derives_stop_and_target()
+    test_partial_buy_reblends_stop_target()
+    test_backfill_exit_levels()
+    test_determine_exits_stop_hit()
+    test_determine_exits_target_hit()
+    test_determine_exits_tie_break_stop_wins()
+    test_determine_exits_skips_entry_bar()
+    test_determine_exits_max_hold_fallback()
+    test_determine_exits_no_exit()
+    test_exit_order_carries_reason()
+    test_reconcile_only_backfills_legacy_levels()
 
     print("\n" + "=" * 60)
     print(f"  RESULTS: {_passed} passed, {_failed} failed")

@@ -18,6 +18,7 @@ from config import (
     STARTING_CAPITAL, MAX_HOLD_DAYS, SLIPPAGE,
     FEE_PER_SHARE, FEE_MIN, FEE_CAP_PCT,
     PORTFOLIO_STATE_FILE, MAX_POSITIONS,
+    STOP_LOSS_PCT, TARGET_PROFIT_PCT,
 )
 
 MAX_TRADE_HISTORY = 1000
@@ -184,14 +185,18 @@ class Portfolio:
         del self.state["open_positions"][ticker]
 
     def apply_buy_fill(self, ticker: str, shares: float, fill_price: float,
-                       commission: float, date: str,
-                       stop_price: float = 0.0, target_price: float = 0.0) -> None:
+                       commission: float, date: str) -> None:
         """Apply a confirmed IBKR BUY fill using the EXACT fill price + commission.
 
         Unlike record_entry (which is for the simulated cost model), this does
         not add slippage or recompute a fee — the broker already reported both.
         Augments an existing position (averages in) so repeated partial fills
         for the same ticker accumulate instead of being rejected.
+
+        Stop/target levels are (re)derived from the resulting average entry price
+        via STOP_LOSS_PCT / TARGET_PROFIT_PCT, so every filled position carries
+        price-exit protection immediately (Phase B). Re-deriving on each partial
+        keeps the levels consistent with the blended entry as shares accumulate.
         """
         if shares <= 0:
             raise ValueError(f"Invalid shares: {shares}")
@@ -217,10 +222,14 @@ class Portfolio:
                 "shares": shares,
                 "entry_price": fill_price,
                 "entry_date": date,
-                "stop_price": stop_price,
-                "target_price": target_price,
+                "stop_price": 0.0,
+                "target_price": 0.0,
                 "entry_fee": commission,
             }
+        # Derive exit levels from the (possibly averaged) entry price.
+        pos = self.state["open_positions"][ticker]
+        pos["stop_price"] = round(pos["entry_price"] * (1 - STOP_LOSS_PCT), 4)
+        pos["target_price"] = round(pos["entry_price"] * (1 + TARGET_PROFIT_PCT), 4)
         self.state["cash"] -= cost
 
     def apply_sell_fill(self, ticker: str, shares: float, fill_price: float,
@@ -263,8 +272,35 @@ class Portfolio:
             pos["shares"] -= sell_shares
             pos["entry_fee"] = pos.get("entry_fee", 0.0) - entry_fee_slice
 
+    def backfill_exit_levels(self) -> list[str]:
+        """Fill in stop/target for any open position missing them (<= 0).
+
+        Positions entered before Phase B were stored with stop_price/target_price
+        == 0 (no price protection). This derives them from the recorded entry
+        price using STOP_LOSS_PCT / TARGET_PROFIT_PCT — exactly as a fresh fill
+        now does — so legacy positions get the same stop/target as new ones. The
+        entry price for those positions IS the fill price, so this is equivalent
+        to having set the levels at fill time. Returns the tickers updated; the
+        caller persists via save().
+        """
+        updated = []
+        for ticker, pos in self.open_positions.items():
+            entry = pos.get("entry_price", 0) or 0
+            if entry <= 0:
+                continue
+            if pos.get("stop_price", 0) and pos.get("target_price", 0):
+                continue
+            pos["stop_price"] = round(entry * (1 - STOP_LOSS_PCT), 4)
+            pos["target_price"] = round(entry * (1 + TARGET_PROFIT_PCT), 4)
+            updated.append(ticker)
+        return updated
+
     def check_exits(self, today: str) -> list[str]:
-        """Return tickers that should be exited (max hold exceeded)."""
+        """Return tickers that should be exited (max hold exceeded).
+
+        Time stop only. Price-based stop/target exits are decided by
+        run_daily.determine_exits, which has access to price bars.
+        """
         try:
             now = datetime.strptime(today, "%Y-%m-%d")
         except ValueError:

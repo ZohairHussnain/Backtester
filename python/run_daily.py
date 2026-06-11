@@ -42,7 +42,7 @@ from config import (
     state_file_for_mode,
     ORDERS_FILE, OUTPUT_DIR, STARTING_CAPITAL, IBKR_PAPER_STRATEGY_CAPITAL,
     THRESHOLD, SLIPPAGE, FEE_PER_SHARE, FEE_MIN, FEE_CAP_PCT,
-    MAX_DATA_STALENESS_TRADING_DAYS,
+    MAX_DATA_STALENESS_TRADING_DAYS, MAX_HOLD_DAYS,
 )
 from download_data import update_prices
 from feature_engine import get_latest_features, load_prices
@@ -459,6 +459,69 @@ def check_data_freshness(latest_date: str, today: str, mode: str,
         sys.exit(1)
 
 
+def determine_exits(portfolio: Portfolio, today: str) -> dict:
+    """Decide which open positions to exit today and why.
+
+    Returns {ticker: reason} where reason is one of:
+      - "stop_hit"      a bar's low traded down to/through the stop level
+      - "target_hit"    a bar's high traded up to/through the target level
+      - "max_hold_exit" held >= MAX_HOLD_DAYS calendar days
+
+    Price exits take precedence over the time stop. For each position we scan the
+    completed daily bars STRICTLY AFTER the entry date, up to and including today
+    (D+1 onward — never the entry bar itself, matching the backtest's
+    signal->next-open timing). A bar is a stop if low <= stop_price and a target
+    if high >= target_price. If a single bar trips BOTH, the tie is broken exactly
+    like LabelEngine.compute_target_stop: whichever level is closer to that bar's
+    open wins, stop on an exact tie. The first triggering bar decides. Exits are
+    acted on at the next open (a MOO/MKT SELL), so this is a daily-check,
+    next-open exit — it does not assume an intrabar fill price.
+    """
+    exits = {}
+    for ticker, pos in portfolio.open_positions.items():
+        entry_date = str(pos.get("entry_date", ""))[:10]
+        stop = pos.get("stop_price", 0) or 0.0
+        target = pos.get("target_price", 0) or 0.0
+        reason = None
+
+        if stop > 0 and target > 0:
+            try:
+                prices = load_prices(ticker)
+                bars = prices[(prices["date"] > entry_date) & (prices["date"] <= today)]
+                for _, bar in bars.iterrows():
+                    low = float(bar["low"])
+                    high = float(bar["high"])
+                    op = float(bar["open"])
+                    stop_hit = low <= stop
+                    target_hit = high >= target
+                    if stop_hit and target_hit:
+                        reason = "stop_hit" if abs(op - stop) <= abs(op - target) else "target_hit"
+                        break
+                    if stop_hit:
+                        reason = "stop_hit"
+                        break
+                    if target_hit:
+                        reason = "target_hit"
+                        break
+            except Exception as e:
+                print(f"  WARNING: exit price scan failed for {ticker}: {e}")
+
+        if reason is None:
+            # Time-based max hold (calendar days, matching prior check_exits).
+            try:
+                entry_dt = datetime.strptime(entry_date, "%Y-%m-%d")
+                now_dt = datetime.strptime(today, "%Y-%m-%d")
+                if (now_dt - entry_dt).days >= MAX_HOLD_DAYS:
+                    reason = "max_hold_exit"
+            except ValueError:
+                print(f"  WARNING: bad entry_date for {ticker}, forcing exit")
+                reason = "max_hold_exit"
+
+        if reason:
+            exits[ticker] = reason
+    return exits
+
+
 def generate_signals_and_orders(portfolio: Portfolio, today: str,
                                 mode: str = "sim", allow_stale: bool = False):
     print("\n[1/7] Updating prices...")
@@ -487,20 +550,25 @@ def generate_signals_and_orders(portfolio: Portfolio, today: str,
     print(f"  {len(predictions)} predictions, {n_above} above threshold {THRESHOLD}")
 
     print("\n[4/7] Checking exits...")
-    exit_tickers = portfolio.check_exits(today)
-    if exit_tickers:
-        print(f"  Exit signals: {exit_tickers}")
+    backfilled = portfolio.backfill_exit_levels()
+    if backfilled:
+        print(f"  Backfilled stop/target on {len(backfilled)} pre-Phase-B "
+              f"position(s) from entry price: {backfilled}")
+    exits = determine_exits(portfolio, today)
+    if exits:
+        for t, r in exits.items():
+            print(f"  EXIT {t}: {r}")
     else:
         print(f"  No exits needed.")
 
     print("\n[5/7] Generating orders...")
     generator = OrderGenerator()
-    orders = generator.generate_orders(predictions, portfolio.get_state(), exit_tickers)
+    orders = generator.generate_orders(predictions, portfolio.get_state(), exits)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     orders.to_csv(ORDERS_FILE, index=False)
     print(f"  {len(orders)} orders saved to {ORDERS_FILE}")
 
-    return orders, predictions, exit_tickers
+    return orders, predictions, exits
 
 
 # ======================================================================
@@ -754,11 +822,23 @@ def run_reconcile_only(today: str):
         print("  Cannot connect to IBKR. Nothing to reconcile.")
         return
 
+    # Ensure every position carries Phase B exit levels. Backfill is pure
+    # metadata (it never generates or submits an exit), it is idempotent, and it
+    # is not time-gated, so --reconcile-only is the natural place to retrofit
+    # legacy positions that were filled before stop/target stamping existed.
+    backfilled = portfolio.backfill_exit_levels()
+    if backfilled:
+        print(f"  Backfilled stop/target on {len(backfilled)} position(s) "
+              f"from entry price: {backfilled}")
+
     reconciler = FillReconciler(OUTPUT_DIR / "fills.csv")
     broker_fills = broker.get_fills()
 
     if not broker_fills:
         print("  No new fills found.")
+        if backfilled:
+            portfolio.save()
+            print("  Saved backfilled exit levels.")
         broker.disconnect()
         return
 
