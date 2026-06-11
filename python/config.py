@@ -92,6 +92,23 @@ TARGET_PROFIT_PCT = 0.10
 MAX_HOLD_DAYS = 20
 
 # ---------------------------------------------------------------------------
+# Rotation / replacement exit
+# ---------------------------------------------------------------------------
+# When the book is full, optionally replace the weakest current holding with a
+# materially stronger new candidate. "Strength" is the per-stock model
+# PREDICTION PROBABILITY for today (NOT AUC, which is a model-level metric).
+# Disabled by default; enable only after a dry-run review. Do not tune yet.
+ROTATION_ENABLED = False
+# A candidate must beat the weakest holding's probability by at least this much
+# to justify the turnover (anti-churn guard).
+ROTATION_MIN_PROB_IMPROVEMENT = 0.05
+# If True, only consider rotation when MAX_POSITIONS is already full (no free
+# slot). If False, rotation may also run while slots remain.
+ROTATION_ONLY_WHEN_FULL = True
+# Cap rotations per day to limit turnover.
+ROTATION_MAX_PER_DAY = 1
+
+# ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
 

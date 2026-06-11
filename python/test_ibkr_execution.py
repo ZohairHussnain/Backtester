@@ -76,6 +76,47 @@ def _fake_prices(price):
     return _loader
 
 
+def _fake_prices_by_ticker(mapping, default=50.0):
+    """load_prices loader returning a per-ticker close (default for the rest)."""
+    def _loader(ticker):
+        return pd.DataFrame({"close": [mapping.get(ticker, default)]})
+    return _loader
+
+
+def _preds(rows, date="2026-06-12"):
+    """Predictions frame from (ticker, probability) tuples."""
+    return pd.DataFrame([{"date": date, "ticker": t, "probability": p}
+                         for (t, p) in rows])
+
+
+def _full_state(holdings, cash=10000.0):
+    """portfolio_state with the given tickers held (10 sh @ $50 each)."""
+    return {"cash": cash, "open_positions": {
+        t: {"shares": 10, "entry_price": 50.0, "entry_date": "2026-06-01",
+            "stop_price": 47.5, "target_price": 55.0, "entry_fee": 1.0}
+        for t in holdings}}
+
+
+def _save_rotation(og):
+    return (og.ROTATION_ENABLED, og.ROTATION_MIN_PROB_IMPROVEMENT,
+            og.ROTATION_ONLY_WHEN_FULL, og.ROTATION_MAX_PER_DAY, og.load_prices)
+
+
+def _restore_rotation(og, saved):
+    (og.ROTATION_ENABLED, og.ROTATION_MIN_PROB_IMPROVEMENT,
+     og.ROTATION_ONLY_WHEN_FULL, og.ROTATION_MAX_PER_DAY, og.load_prices) = saved
+
+
+def _set_rotation(og, enabled=True, improvement=0.05, only_full=True,
+                  max_per_day=1, prices=None):
+    og.ROTATION_ENABLED = enabled
+    og.ROTATION_MIN_PROB_IMPROVEMENT = improvement
+    og.ROTATION_ONLY_WHEN_FULL = only_full
+    og.ROTATION_MAX_PER_DAY = max_per_day
+    if prices is not None:
+        og.load_prices = prices
+
+
 def _fake_bars(bars):
     """Return a load_prices loader yielding the given OHLC bars.
 
@@ -788,6 +829,187 @@ def test_buy_fill_unaffected_by_exit_reasons():
 
 
 # ---------------------------------------------------------------------------
+# Rotation / replacement exit
+# ---------------------------------------------------------------------------
+
+def test_rotation_disabled_by_default():
+    print("\n[RO1] rotation is OFF by default -> full book produces no orders")
+    import config
+    import order_generator as og
+    check(config.ROTATION_ENABLED is False, "shipped default ROTATION_ENABLED is False")
+    saved = _save_rotation(og)
+    try:
+        og.ROTATION_ENABLED = False
+        og.load_prices = _fake_prices_by_ticker({})
+        gen = og.OrderGenerator()
+        gen.max_positions = 2
+        preds = _preds([("AAA", 0.50), ("BBB", 0.55), ("CCC", 0.90)])
+        orders = gen.generate_orders(preds, _full_state(["AAA", "BBB"]), {})
+        check(orders.empty, "full book + rotation disabled -> no orders (regression)")
+    finally:
+        _restore_rotation(og, saved)
+
+
+def test_rotation_triggers_when_full():
+    print("\n[RO2] full book + strong candidate -> SELL weakest, BUY candidate")
+    import order_generator as og
+    saved = _save_rotation(og)
+    try:
+        _set_rotation(og, enabled=True, improvement=0.05, only_full=True,
+                      max_per_day=1, prices=_fake_prices_by_ticker({}))
+        gen = og.OrderGenerator()
+        gen.max_positions = 2
+        preds = _preds([("AAA", 0.50), ("BBB", 0.55), ("CCC", 0.90)])
+        orders = gen.generate_orders(preds, _full_state(["AAA", "BBB"]), {}) \
+            .reset_index(drop=True)
+        sells = orders[orders["action"] == "SELL"]
+        buys = orders[orders["action"] == "BUY"]
+        check(len(sells) == 1 and sells.iloc[0]["ticker"] == "AAA",
+              "weakest holding AAA (prob 0.50) is sold")
+        check(sells.iloc[0]["reason"] == "rotation_exit", "SELL reason is rotation_exit")
+        check(len(buys) == 1 and buys.iloc[0]["ticker"] == "CCC",
+              "stronger candidate CCC is bought")
+        check(str(buys.iloc[0]["reason"]).startswith("rotation_in"),
+              "BUY reason records the rotation")
+        sell_idx = orders.index[orders["action"] == "SELL"][0]
+        buy_idx = orders.index[orders["action"] == "BUY"][0]
+        check(sell_idx < buy_idx, "SELL row precedes BUY row (submission order)")
+    finally:
+        _restore_rotation(og, saved)
+
+
+def test_rotation_below_improvement_does_nothing():
+    print("\n[RO3] candidate not enough stronger -> no rotation (anti-churn)")
+    import order_generator as og
+    saved = _save_rotation(og)
+    try:
+        _set_rotation(og, enabled=True, improvement=0.05, only_full=True,
+                      prices=_fake_prices_by_ticker({}))
+        gen = og.OrderGenerator()
+        gen.max_positions = 2
+        # weakest = AAA 0.50; need >= 0.55; candidate CCC only 0.53.
+        preds = _preds([("AAA", 0.50), ("BBB", 0.55), ("CCC", 0.53)])
+        orders = gen.generate_orders(preds, _full_state(["AAA", "BBB"]), {})
+        check(orders.empty, "0.53 < 0.50 + 0.05 -> no rotation")
+    finally:
+        _restore_rotation(og, saved)
+
+
+def test_rotation_excludes_position_already_exiting():
+    print("\n[RO4] never rotates out a position already exiting that day")
+    import order_generator as og
+    saved = _save_rotation(og)
+    try:
+        # only_full=False so rotation runs even with a free slot (AAA exiting).
+        _set_rotation(og, enabled=True, improvement=0.05, only_full=False,
+                      max_per_day=1, prices=_fake_prices_by_ticker({}))
+        gen = og.OrderGenerator()
+        gen.max_positions = 10
+        preds = _preds([("AAA", 0.40), ("BBB", 0.55), ("CCC", 0.60), ("DDD", 0.90)])
+        state = _full_state(["AAA", "BBB", "CCC"])
+        orders = gen.generate_orders(preds, state, {"AAA": "stop_hit"})
+        sells = orders[orders["action"] == "SELL"]
+        aaa = sells[sells["ticker"] == "AAA"]
+        check(aaa.iloc[0]["reason"] == "stop_hit",
+              "AAA leaves via its stop, not rotation")
+        check(sells[(sells["ticker"] == "AAA") &
+                    (sells["reason"] == "rotation_exit")].empty,
+              "AAA is never rotation_exit despite being weakest (it is exiting)")
+        rot = sells[sells["reason"] == "rotation_exit"]
+        check(len(rot) == 1 and rot.iloc[0]["ticker"] == "BBB",
+              "rotation sells BBB (weakest ELIGIBLE), not the exiting AAA")
+    finally:
+        _restore_rotation(og, saved)
+
+
+def test_rotation_atomic_no_naked_sell():
+    print("\n[RO5] if the replacement BUY can't be placed, emit NEITHER order")
+    import order_generator as og
+    saved = _save_rotation(og)
+    try:
+        # CCC priced so high the BUY floors to < 1 share -> rotation must abort.
+        _set_rotation(og, enabled=True, improvement=0.05, only_full=True,
+                      prices=_fake_prices_by_ticker({"CCC": 100000.0}, default=50.0))
+        gen = og.OrderGenerator()
+        gen.max_positions = 2
+        preds = _preds([("AAA", 0.50), ("BBB", 0.55), ("CCC", 0.90)])
+        orders = gen.generate_orders(preds, _full_state(["AAA", "BBB"], cash=1000.0), {})
+        check(orders.empty, "no viable BUY -> no SELL either (no naked sell)")
+    finally:
+        _restore_rotation(og, saved)
+
+
+def test_rotation_respects_max_per_day():
+    print("\n[RO6] rotations are capped at ROTATION_MAX_PER_DAY")
+    import order_generator as og
+    saved = _save_rotation(og)
+    try:
+        _set_rotation(og, enabled=True, improvement=0.05, only_full=True,
+                      max_per_day=2, prices=_fake_prices_by_ticker({}))
+        gen = og.OrderGenerator()
+        gen.max_positions = 3
+        # 3 weak holdings, 3 strong candidates -> all 3 would qualify; cap = 2.
+        preds = _preds([("AAA", 0.40), ("BBB", 0.45), ("CCC", 0.50),
+                        ("DDD", 0.95), ("EEE", 0.92), ("FFF", 0.91)])
+        state = _full_state(["AAA", "BBB", "CCC"])
+        orders = gen.generate_orders(preds, state, {})
+        rot = orders[(orders["action"] == "SELL") & (orders["reason"] == "rotation_exit")]
+        check(len(rot) == 2, "exactly 2 rotation_exit SELLs (capped), not 3")
+    finally:
+        _restore_rotation(og, saved)
+
+
+def test_rotation_excludes_holding_without_prediction():
+    print("\n[RO7] a holding with no prediction today is not force-rotated")
+    import order_generator as og
+    saved = _save_rotation(og)
+    try:
+        _set_rotation(og, enabled=True, improvement=0.05, only_full=True,
+                      prices=_fake_prices_by_ticker({}))
+        gen = og.OrderGenerator()
+        gen.max_positions = 2
+        # AAA held but has NO prediction row; BBB held with 0.55; CCC candidate 0.90.
+        preds = _preds([("BBB", 0.55), ("CCC", 0.90)])
+        orders = gen.generate_orders(preds, _full_state(["AAA", "BBB"]), {})
+        rot = orders[(orders["action"] == "SELL") & (orders["reason"] == "rotation_exit")]
+        check(len(rot) == 1 and rot.iloc[0]["ticker"] == "BBB",
+              "rotates the ranked holding BBB, never the unscored AAA")
+    finally:
+        _restore_rotation(og, saved)
+
+
+def test_reconcile_applies_sells_before_buys():
+    print("\n[R1] reconciliation applies SELL fills before BUY fills")
+    # Tight cash: a BUY applied before its paired SELL would fail; SELL-first works.
+    p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+    p.apply_buy_fill("AAA", 10, 50.0, 1.0, "2026-06-10")
+    p.get_state()["cash"] = 100.0
+    buy = Fill("B1", "o1", "CCC", Action.BUY, 8, 50.0, 1.0, "2026-06-12T09:30:01")
+    sell = Fill("S1", "o2", "AAA", Action.SELL, 10, 50.0, 1.0, "2026-06-12T09:30:00")
+
+    # Production sort key (mirrors run_reconcile_only / run_ibkr_paper).
+    ordered = sorted([buy, sell], key=lambda f: 0 if f.action == Action.SELL else 1)
+    exit_reasons = {"AAA": "rotation_exit"}
+    applied = [run_daily.apply_fill(p, f, "2026-06-12", exit_reasons) for f in ordered]
+    check(all(applied), "both fills applied when SELL precedes BUY")
+    check("AAA" not in p.open_positions, "AAA sold")
+    check("CCC" in p.open_positions, "CCC bought from freed cash")
+    check(p.get_state()["trade_history"][0]["reason"] == "rotation_exit",
+          "rotation SELL booked as rotation_exit")
+
+    # Prove the unsorted (BUY-first) order would have failed -> why we sort.
+    p2 = Portfolio(Path(tempfile.mktemp()), 10000.0)
+    p2.apply_buy_fill("AAA", 10, 50.0, 1.0, "2026-06-10")
+    p2.get_state()["cash"] = 100.0
+    raised = False
+    try:
+        run_daily.apply_fill(p2, buy, "2026-06-12")  # BUY first, tight cash
+    except ValueError:
+        raised = True
+    check(raised, "BUY-before-SELL raises Insufficient cash (the reason for the sort)")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -842,6 +1064,14 @@ def main():
     test_sell_fill_reason_defaults_when_unknown()
     test_reconcile_sell_propagates_reason_end_to_end()
     test_buy_fill_unaffected_by_exit_reasons()
+    test_rotation_disabled_by_default()
+    test_rotation_triggers_when_full()
+    test_rotation_below_improvement_does_nothing()
+    test_rotation_excludes_position_already_exiting()
+    test_rotation_atomic_no_naked_sell()
+    test_rotation_respects_max_per_day()
+    test_rotation_excludes_holding_without_prediction()
+    test_reconcile_applies_sells_before_buys()
 
     print("\n" + "=" * 60)
     print(f"  RESULTS: {_passed} passed, {_failed} failed")

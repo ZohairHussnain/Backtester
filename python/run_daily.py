@@ -789,6 +789,9 @@ def run_ibkr_paper(today: str, order_type: str = "MOO", allow_stale: bool = Fals
                         if o.action == Action.SELL and o.reason}
         broker_fills = broker.get_fills()
         fills = reconciler.reconcile(broker_fills, submitted_orders) if broker_fills else []
+        # Apply SELLs before BUYs (see run_reconcile_only): a rotation SELL frees
+        # cash its paired BUY may need, and local cash updates only from fills.
+        fills = sorted(fills, key=lambda f: 0 if f.action == Action.SELL else 1)
         for fill in fills:
             try:
                 if apply_fill(portfolio, fill, today, exit_reasons):
@@ -854,6 +857,9 @@ def run_reconcile_only(today: str):
                     if o.action == Action.SELL and o.reason}
 
     fills = reconciler.reconcile(broker_fills, pending_orders)
+    # Apply SELLs before BUYs: a same-day rotation/replacement frees cash on the
+    # SELL that the paired BUY may need, and local cash updates only from fills.
+    fills = sorted(fills, key=lambda f: 0 if f.action == Action.SELL else 1)
     applied = []
     for fill in fills:
         try:
