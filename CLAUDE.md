@@ -64,8 +64,9 @@ python test_ibkr_connection.py
 
 # Python test suites (zero-dependency assert harness, temp files only)
 python test_state_isolation.py    # sim/paper state isolation, migration, reset
-python test_ibkr_execution.py     # preflight, integer shares, reconciliation, stale-price guard
+python test_ibkr_execution.py     # preflight, integer shares, reconciliation, exits, rotation
 python test_ibkr_sync.py          # broker-truth snapshot, position diff, paper-ledger rebuild
+python test_download_data.py      # intraday fallback for NaN-close daily bars
 ```
 
 There is no pytest setup. Tests are plain scripts with a `check(cond, msg)` harness that exits non-zero on any failure. Run them directly. Match this style when adding tests.

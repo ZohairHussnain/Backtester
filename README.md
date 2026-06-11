@@ -102,6 +102,7 @@ python test_ibkr_connection.py
 # Python test suites (zero-dependency assert harness)
 python test_state_isolation.py    # sim/paper state isolation, migration, reset
 python test_ibkr_execution.py     # preflight, integer shares, reconciliation, stale-price guard
+python test_download_data.py      # intraday fallback for NaN-close daily bars
 ```
 
 ## Signal Timing (critical for correctness)
