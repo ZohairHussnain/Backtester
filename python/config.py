@@ -98,7 +98,7 @@ MAX_HOLD_DAYS = 20
 # materially stronger new candidate. "Strength" is the per-stock model
 # PREDICTION PROBABILITY for today (NOT AUC, which is a model-level metric).
 # Disabled by default; enable only after a dry-run review. Do not tune yet.
-ROTATION_ENABLED = False
+ROTATION_ENABLED = True
 # A candidate must beat the weakest holding's probability by at least this much
 # to justify the turnover (anti-churn guard).
 ROTATION_MIN_PROB_IMPROVEMENT = 0.05
