@@ -465,7 +465,7 @@ def determine_exits(portfolio: Portfolio, today: str) -> dict:
     Returns {ticker: reason} where reason is one of:
       - "stop_hit"      a bar's low traded down to/through the stop level
       - "target_hit"    a bar's high traded up to/through the target level
-      - "max_hold_exit" held >= MAX_HOLD_DAYS calendar days
+      - "max_hold_exit" held >= MAX_HOLD_DAYS NYSE trading sessions
 
     Price exits take precedence over the time stop. For each position we scan the
     completed daily bars STRICTLY AFTER the entry date, up to and including today
@@ -507,14 +507,16 @@ def determine_exits(portfolio: Portfolio, today: str) -> dict:
                 print(f"  WARNING: exit price scan failed for {ticker}: {e}")
 
         if reason is None:
-            # Time-based max hold (calendar days, matching prior check_exits).
-            try:
-                entry_dt = datetime.strptime(entry_date, "%Y-%m-%d")
-                now_dt = datetime.strptime(today, "%Y-%m-%d")
-                if (now_dt - entry_dt).days >= MAX_HOLD_DAYS:
-                    reason = "max_hold_exit"
-            except ValueError:
+            # Time-based max hold, counted in NYSE TRADING SESSIONS (not calendar
+            # days) so it matches the backtest/LabelEngine horizon, which is in
+            # bars. trading_days_between counts sessions strictly after the entry
+            # date up to and including today (weekend/holiday aware); it returns
+            # -1 when the date won't parse.
+            held_sessions = trading_days_between(entry_date, today)
+            if held_sessions < 0:
                 print(f"  WARNING: bad entry_date for {ticker}, forcing exit")
+                reason = "max_hold_exit"
+            elif held_sessions >= MAX_HOLD_DAYS:
                 reason = "max_hold_exit"
 
         if reason:
@@ -783,11 +785,13 @@ def run_ibkr_paper(today: str, order_type: str = "MOO", allow_stale: bool = Fals
     applied = []
     if order_type == "MKT":
         print("\n  Checking for immediate fills...")
+        exit_reasons = {o.ticker: o.reason for o in submitted_orders
+                        if o.action == Action.SELL and o.reason}
         broker_fills = broker.get_fills()
         fills = reconciler.reconcile(broker_fills, submitted_orders) if broker_fills else []
         for fill in fills:
             try:
-                if apply_fill(portfolio, fill, today):
+                if apply_fill(portfolio, fill, today, exit_reasons):
                     applied.append(fill)
                     print(f"    FILLED: {fill.action.value} {fill.shares_filled:.0f} "
                           f"{fill.ticker} @ ${fill.fill_price:.2f}")
@@ -846,12 +850,14 @@ def run_reconcile_only(today: str):
 
     lifecycle_path = OUTPUT_DIR / "orders_lifecycle.csv"
     pending_orders = load_pending_orders_from_lifecycle(lifecycle_path)
+    exit_reasons = {o.ticker: o.reason for o in pending_orders
+                    if o.action == Action.SELL and o.reason}
 
     fills = reconciler.reconcile(broker_fills, pending_orders)
     applied = []
     for fill in fills:
         try:
-            if apply_fill(portfolio, fill, today):
+            if apply_fill(portfolio, fill, today, exit_reasons):
                 applied.append(fill)
                 print(f"    RECONCILED: {fill.action.value} {fill.shares_filled:.0f} "
                       f"{fill.ticker} @ ${fill.fill_price:.2f}")
@@ -874,7 +880,8 @@ def run_reconcile_only(today: str):
 # Helpers
 # ======================================================================
 
-def apply_fill(portfolio: Portfolio, fill, today: str) -> bool:
+def apply_fill(portfolio: Portfolio, fill, today: str,
+               exit_reasons: dict = None) -> bool:
     """Apply a confirmed broker fill to the strategy ledger.
 
     Returns True if the fill was applied, False if it was already processed
@@ -882,6 +889,12 @@ def apply_fill(portfolio: Portfolio, fill, today: str) -> bool:
     simulated slippage/fee) and supports partial fills. The fill id is marked
     processed in the same Portfolio state that records the fill's effect, so the
     mark and the effect are committed together on the next atomic save().
+
+    exit_reasons: optional {ticker: reason} built from the pending SELL orders.
+    A SELL is booked into trade_history with WHY it exited
+    (stop_hit / target_hit / max_hold_exit) instead of a generic label. Falls
+    back to "ibkr_fill" when the reason is unknown (e.g. a manual or unmatched
+    sell with no originating order).
     """
     if portfolio.is_fill_processed(fill.fill_id):
         return False
@@ -891,9 +904,10 @@ def apply_fill(portfolio: Portfolio, fill, today: str) -> bool:
             fill.ticker, fill.shares_filled, fill.fill_price,
             fill.commission, fill_date)
     else:
+        reason = (exit_reasons or {}).get(fill.ticker, "ibkr_fill")
         portfolio.apply_sell_fill(
             fill.ticker, fill.shares_filled, fill.fill_price,
-            fill.commission, fill_date, "ibkr_fill")
+            fill.commission, fill_date, reason)
     portfolio.mark_fill_processed(fill.fill_id)
     return True
 

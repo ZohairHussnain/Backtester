@@ -691,6 +691,102 @@ def test_reconcile_only_backfills_legacy_levels():
         check(abs(pos["target_price"] - 220.0) < 1e-6, "reconcile-only persisted target=220")
 
 
+def test_max_hold_uses_trading_days():
+    print("\n[B12] max-hold counts trading sessions, not calendar days")
+    from datetime import date, timedelta
+    saved = run_daily.load_prices
+    try:
+        entry = "2026-06-10"
+        # Flat bar within the stop/target band -> only the time stop can fire.
+        run_daily.load_prices = _fake_bars([("2026-06-11", 100.0, 101.0, 99.0)])
+
+        def find_today(n):
+            d = date(2026, 6, 11)
+            for _ in range(150):
+                t = d.isoformat()
+                if run_daily.trading_days_between(entry, t) == n:
+                    return t
+                d += timedelta(days=1)
+            raise AssertionError(f"no date with {n} sessions")
+
+        t19 = find_today(19)   # one session short of the 20-session threshold
+        t20 = find_today(20)   # exactly at the threshold
+
+        # At 19 trading sessions, MORE than 20 calendar days have elapsed, so a
+        # calendar-day rule WOULD exit here. A trading-day rule must not.
+        cal_days = (datetime.strptime(t19, "%Y-%m-%d")
+                    - datetime.strptime(entry, "%Y-%m-%d")).days
+        check(cal_days >= 20, f"19 sessions spans >= 20 calendar days (got {cal_days})")
+
+        p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+        p.apply_buy_fill("AAA", 1, 100.0, 1.0, entry)
+        check("AAA" not in run_daily.determine_exits(p, t19),
+              f"19 trading sessions ({t19}) does NOT trigger max-hold")
+        check(run_daily.determine_exits(p, t20).get("AAA") == "max_hold_exit",
+              f"20 trading sessions ({t20}) triggers max_hold_exit")
+    finally:
+        run_daily.load_prices = saved
+
+
+def test_sell_fill_records_exit_reason():
+    print("\n[B13] a SELL fill books its exit reason into trade_history")
+    for reason in ("stop_hit", "target_hit", "max_hold_exit"):
+        p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+        p.apply_buy_fill("AAA", 10, 100.0, 1.0, "2026-06-10")
+        sell = Fill("S1", "o1", "AAA", Action.SELL, 10, 105.0, 1.0, "2026-06-12T09:30:00")
+        applied = run_daily.apply_fill(p, sell, "2026-06-12", {"AAA": reason})
+        th = p.get_state()["trade_history"]
+        check(applied is True, f"{reason}: sell applied")
+        check(len(th) == 1 and th[0]["reason"] == reason,
+              f"trade_history reason == {reason}")
+        check("AAA" not in p.open_positions, f"{reason}: position closed")
+
+
+def test_sell_fill_reason_defaults_when_unknown():
+    print("\n[B13b] a SELL with no known reason falls back to 'ibkr_fill'")
+    p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+    p.apply_buy_fill("AAA", 10, 100.0, 1.0, "2026-06-10")
+    sell = Fill("S2", "o1", "AAA", Action.SELL, 10, 105.0, 1.0, "2026-06-12T09:30:00")
+    run_daily.apply_fill(p, sell, "2026-06-12")  # no exit_reasons map
+    th = p.get_state()["trade_history"]
+    check(th[0]["reason"] == "ibkr_fill", "unknown-reason sell defaults to ibkr_fill")
+
+
+def test_reconcile_sell_propagates_reason_end_to_end():
+    print("\n[B14] reconcile path maps a SELL order's reason into trade_history")
+    p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+    p.apply_buy_fill("AAA", 9, 80.0, 1.0, "2026-06-10")
+    # SELL order as load_pending_orders_from_lifecycle would produce it.
+    sell_order = Order(
+        order_id="o1", date="2026-06-12", ticker="AAA", action=Action.SELL,
+        shares=9, order_type="MOO", stop_price=0, target_price=0,
+        status=OrderStatus.SUBMITTED, reason="stop_hit",
+        broker_order_id="55", perm_id="P9")
+    # Mirror the call-site mapping used by run_reconcile_only / run_ibkr_paper.
+    exit_reasons = {o.ticker: o.reason for o in [sell_order]
+                    if o.action == Action.SELL and o.reason}
+    r = FillReconciler(None)
+    bf = _broker_fill("AAA", "SELL", 9, 79.0, fill_id="EX", perm_id="P9", order_id="0")
+    fills = r.reconcile([bf], [sell_order])
+    for f in fills:
+        run_daily.apply_fill(p, f, "2026-06-12", exit_reasons)
+    th = p.get_state()["trade_history"]
+    check(len(th) == 1 and th[0]["reason"] == "stop_hit",
+          "reconciled SELL booked as stop_hit end-to-end")
+
+
+def test_buy_fill_unaffected_by_exit_reasons():
+    print("\n[B15] BUY fills ignore exit_reasons (no regression)")
+    p = Portfolio(Path(tempfile.mktemp()), 10000.0)
+    buy = Fill("E1", "o1", "AAA", Action.BUY, 10, 50.0, 1.0, "2026-06-10T09:30:00")
+    applied = run_daily.apply_fill(p, buy, "2026-06-10", {"AAA": "stop_hit"})
+    pos = p.open_positions["AAA"]
+    check(applied is True, "buy applied")
+    check(pos["shares"] == 10, "buy added 10 shares")
+    check(abs(pos["stop_price"] - 47.5) < 1e-6, "buy still stamps stop from fill price (50*0.95)")
+    check(len(p.get_state()["trade_history"]) == 0, "buy writes no trade record")
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -741,6 +837,11 @@ def main():
     test_determine_exits_no_exit()
     test_exit_order_carries_reason()
     test_reconcile_only_backfills_legacy_levels()
+    test_max_hold_uses_trading_days()
+    test_sell_fill_records_exit_reason()
+    test_sell_fill_reason_defaults_when_unknown()
+    test_reconcile_sell_propagates_reason_end_to_end()
+    test_buy_fill_unaffected_by_exit_reasons()
 
     print("\n" + "=" * 60)
     print(f"  RESULTS: {_passed} passed, {_failed} failed")
