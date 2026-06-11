@@ -832,11 +832,9 @@ def test_buy_fill_unaffected_by_exit_reasons():
 # Rotation / replacement exit
 # ---------------------------------------------------------------------------
 
-def test_rotation_disabled_by_default():
-    print("\n[RO1] rotation is OFF by default -> full book produces no orders")
-    import config
+def test_rotation_disabled_produces_no_orders():
+    print("\n[RO1] rotation disabled -> full book produces no orders (regression)")
     import order_generator as og
-    check(config.ROTATION_ENABLED is False, "shipped default ROTATION_ENABLED is False")
     saved = _save_rotation(og)
     try:
         og.ROTATION_ENABLED = False
@@ -1010,6 +1008,96 @@ def test_reconcile_applies_sells_before_buys():
 
 
 # ---------------------------------------------------------------------------
+# Lifecycle status write-back
+# ---------------------------------------------------------------------------
+
+def _life_order(ticker, order_id, date, shares=9, action="BUY",
+                status=OrderStatus.SUBMITTED):
+    return Order(order_id=order_id, date=date, ticker=ticker,
+                 action=Action(action), shares=shares, order_type="MOO",
+                 stop_price=0, target_price=0, status=status, reason="signal",
+                 broker_order_id=None, perm_id=None)
+
+
+def _write_lifecycle(path, orders):
+    from execution.order_manager import OrderManager
+    OrderManager(path).log_orders(orders)
+
+
+def test_lifecycle_writeback_marks_filled():
+    print("\n[LB1] a filled order is written back as FILLED")
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "orders_lifecycle.csv"
+        o = _life_order("AAA", "oid1", "2026-06-12", shares=9)
+        _write_lifecycle(path, [o])
+        o.status = OrderStatus.FILLED
+        o.fill_shares = 9
+        o.filled_at = "2026-06-12T09:30:05"
+        run_daily.update_lifecycle_statuses(path, [o], "2026-06-12")
+        row = pd.read_csv(path).set_index("order_id").loc["oid1"]
+        check(row["status"] == "FILLED", "status updated to FILLED")
+        check(int(float(row["fill_shares"])) == 9, "fill_shares written back")
+
+
+def test_lifecycle_writeback_marks_prior_day_cancelled():
+    print("\n[LB2] a prior-day unfilled order is marked CANCELLED")
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "orders_lifecycle.csv"
+        o = _life_order("BBB", "oid2", "2026-06-10")  # prior day, never filled
+        _write_lifecycle(path, [o])
+        run_daily.update_lifecycle_statuses(path, [o], "2026-06-11")
+        row = pd.read_csv(path).set_index("order_id").loc["oid2"]
+        check(row["status"] == "CANCELLED", "prior-day unfilled order -> CANCELLED")
+
+
+def test_lifecycle_writeback_leaves_same_day_open():
+    print("\n[LB3] a same-day unfilled order is left SUBMITTED")
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "orders_lifecycle.csv"
+        o = _life_order("CCC", "oid3", "2026-06-11")
+        _write_lifecycle(path, [o])
+        run_daily.update_lifecycle_statuses(path, [o], "2026-06-11")  # same day
+        row = pd.read_csv(path).set_index("order_id").loc["oid3"]
+        check(row["status"] == "SUBMITTED", "same-day unfilled order untouched")
+
+
+def test_lifecycle_writeback_scenario():
+    print("\n[LB4] 4 MOO: 2 fill -> FILLED, 2 cancel -> CANCELLED next day")
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "orders_lifecycle.csv"
+        o1 = _life_order("T", "o1", "2026-06-12")
+        o2 = _life_order("ABT", "o2", "2026-06-12")
+        o3 = _life_order("CMCSA", "o3", "2026-06-12")
+        o4 = _life_order("IBM", "o4", "2026-06-12")
+        _write_lifecycle(path, [o1, o2, o3, o4])
+
+        # After the open: 2 fill, 2 do not (broker cancels them).
+        for o, sh in [(o1, 9), (o2, 8)]:
+            o.status = OrderStatus.FILLED
+            o.fill_shares = sh
+            o.filled_at = "2026-06-12T09:30:05"
+        run_daily.update_lifecycle_statuses(path, [o1, o2, o3, o4], "2026-06-12")
+
+        df = pd.read_csv(path).set_index("order_id")
+        check(df.loc["o1", "status"] == "FILLED" and df.loc["o2", "status"] == "FILLED",
+              "the 2 fills -> FILLED")
+        check(df.loc["o3", "status"] == "SUBMITTED" and df.loc["o4", "status"] == "SUBMITTED",
+              "the 2 unfilled stay SUBMITTED same day (may still be working)")
+        pend = run_daily.load_pending_orders_from_lifecycle(path)
+        check({o.order_id for o in pend} == {"o3", "o4"},
+              "only the 2 open orders reload as pending")
+
+        # Next day's reconcile (no fills): the 2 stragglers terminalize.
+        run_daily.update_lifecycle_statuses(path, pend, "2026-06-13")
+        df2 = pd.read_csv(path).set_index("order_id")
+        check(df2.loc["o3", "status"] == "CANCELLED" and df2.loc["o4", "status"] == "CANCELLED",
+              "prior-day unfilled -> CANCELLED")
+        check(df2.loc["o1", "status"] == "FILLED", "already-FILLED rows untouched")
+        check(len(run_daily.load_pending_orders_from_lifecycle(path)) == 0,
+              "nothing reloads as pending after terminalization")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1064,7 +1152,7 @@ def main():
     test_sell_fill_reason_defaults_when_unknown()
     test_reconcile_sell_propagates_reason_end_to_end()
     test_buy_fill_unaffected_by_exit_reasons()
-    test_rotation_disabled_by_default()
+    test_rotation_disabled_produces_no_orders()
     test_rotation_triggers_when_full()
     test_rotation_below_improvement_does_nothing()
     test_rotation_excludes_position_already_exiting()
@@ -1072,6 +1160,10 @@ def main():
     test_rotation_respects_max_per_day()
     test_rotation_excludes_holding_without_prediction()
     test_reconcile_applies_sells_before_buys()
+    test_lifecycle_writeback_marks_filled()
+    test_lifecycle_writeback_marks_prior_day_cancelled()
+    test_lifecycle_writeback_leaves_same_day_open()
+    test_lifecycle_writeback_scenario()
 
     print("\n" + "=" * 60)
     print(f"  RESULTS: {_passed} passed, {_failed} failed")

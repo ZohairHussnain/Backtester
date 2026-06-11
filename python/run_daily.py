@@ -812,6 +812,9 @@ def run_ibkr_paper(today: str, order_type: str = "MOO", allow_stale: bool = Fals
     # fills audit log, so a crash can never leave an audited-but-unapplied fill.
     _save_and_report(portfolio, orders, predictions, today)
     reconciler.log_fills(applied)
+    # Reflect any immediate MKT fills in the lifecycle log (marks FILLED). Same-
+    # day un-filled orders are left as SUBMITTED and resolved by --reconcile-only.
+    update_lifecycle_statuses(OUTPUT_DIR / "orders_lifecycle.csv", submitted_orders, today)
 
 
 # ======================================================================
@@ -839,10 +842,18 @@ def run_reconcile_only(today: str):
               f"from entry price: {backfilled}")
 
     reconciler = FillReconciler(OUTPUT_DIR / "fills.csv")
+    lifecycle_path = OUTPUT_DIR / "orders_lifecycle.csv"
+    pending_orders = load_pending_orders_from_lifecycle(lifecycle_path)
+    exit_reasons = {o.ticker: o.reason for o in pending_orders
+                    if o.action == Action.SELL and o.reason}
+
     broker_fills = broker.get_fills()
 
     if not broker_fills:
         print("  No new fills found.")
+        # Even with no fills, terminalize prior-day orders that can no longer be
+        # working so the audit log stops showing them as SUBMITTED indefinitely.
+        update_lifecycle_statuses(lifecycle_path, pending_orders, today)
         if backfilled:
             portfolio.save()
             print("  Saved backfilled exit levels.")
@@ -850,11 +861,6 @@ def run_reconcile_only(today: str):
         return
 
     print(f"  Found {len(broker_fills)} fills.")
-
-    lifecycle_path = OUTPUT_DIR / "orders_lifecycle.csv"
-    pending_orders = load_pending_orders_from_lifecycle(lifecycle_path)
-    exit_reasons = {o.ticker: o.reason for o in pending_orders
-                    if o.action == Action.SELL and o.reason}
 
     fills = reconciler.reconcile(broker_fills, pending_orders)
     # Apply SELLs before BUYs: a same-day rotation/replacement frees cash on the
@@ -878,6 +884,9 @@ def run_reconcile_only(today: str):
     # Save state (commits processed_fill_ids atomically) BEFORE the audit log.
     portfolio.save()
     reconciler.log_fills(applied)
+    # Write terminal statuses back to the lifecycle log: reconcile() set FILLED /
+    # PARTIALLY_FILLED on matched orders; prior-day unfilled orders -> CANCELLED.
+    update_lifecycle_statuses(lifecycle_path, pending_orders, today)
     broker.disconnect()
     print(f"  Portfolio updated. Cash: ${portfolio.cash:,.2f}")
 
@@ -945,6 +954,68 @@ def load_pending_orders_from_lifecycle(lifecycle_path: Path) -> list:
             perm_id=_opt("perm_id"),
         ))
     return pending
+
+
+def update_lifecycle_statuses(lifecycle_path: Path, orders: list, today: str) -> None:
+    """Write terminal order statuses back to orders_lifecycle.csv (audit only).
+
+    The lifecycle log is otherwise append-only and never learns that an order
+    filled or was cancelled, so working orders show as SUBMITTED forever and keep
+    being re-loaded as 'pending'. After reconciliation we update it:
+
+      - an order matched to fills is marked FILLED,
+      - any still-open order from a PRIOR day that did not fully fill is marked
+        CANCELLED -- MOO/MKT orders are day-orders, so a prior-day order can no
+        longer be working; it either filled or the broker cancelled/expired it,
+      - same-day open orders are left untouched (they may still be working) and
+        resolve on a later run.
+
+    This is intentionally conservative: it NEVER terminalizes a same-day order
+    that hasn't filled, so it can never strand a not-yet-arrived fill (a fill
+    only matches orders still loaded as pending). Keyed on the stable local
+    order_id. Atomic rewrite. Never raises -- audit convenience only, it must
+    not break state reconciliation.
+    """
+    if not lifecycle_path.exists() or not orders:
+        return
+    try:
+        import pandas as pd
+        today10 = str(today)[:10]
+        open_statuses = {"SUBMITTED", "PENDING", "PARTIALLY_FILLED"}
+        updates = {}  # order_id -> (new_status, fill_shares, filled_at)
+        for o in orders:
+            if o.status == OrderStatus.FILLED:
+                updates[str(o.order_id)] = ("FILLED", o.fill_shares, o.filled_at)
+            elif str(o.date)[:10] < today10:
+                updates[str(o.order_id)] = ("CANCELLED", o.fill_shares, o.filled_at)
+        if not updates:
+            return
+
+        df = pd.read_csv(lifecycle_path, dtype=str)
+        if "order_id" not in df.columns or "status" not in df.columns:
+            return
+
+        changed = 0
+        for i in range(len(df)):
+            oid = str(df.at[i, "order_id"])
+            cur = df.at[i, "status"]
+            if oid in updates and cur in open_statuses:
+                new_status, fshares, fat = updates[oid]
+                if cur != new_status:
+                    df.at[i, "status"] = new_status
+                    if fshares is not None and "fill_shares" in df.columns:
+                        df.at[i, "fill_shares"] = fshares
+                    if fat and "filled_at" in df.columns:
+                        df.at[i, "filled_at"] = fat
+                    changed += 1
+
+        if changed:
+            tmp = Path(str(lifecycle_path) + ".tmp")
+            df.to_csv(tmp, index=False)
+            tmp.replace(lifecycle_path)
+            print(f"  Lifecycle: marked {changed} order(s) terminal (FILLED/CANCELLED).")
+    except Exception as e:
+        print(f"  WARNING: lifecycle status write-back skipped ({e}).")
 
 
 def check_duplicate(portfolio: Portfolio, today: str) -> bool:
