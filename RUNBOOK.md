@@ -293,6 +293,7 @@ python run_daily.py --reconcile-only
 | After close | `.\build\Debug\BackTester.exe` then `python walk_forward_train.py` | (periodically) refresh dataset + retrain |
 | Pre-market 04:00–09:25 ET | `python run_daily.py --mode ibkr_paper --confirm-paper-orders` | submit MOO orders |
 | After open | `python run_daily.py --reconcile-only` | fetch fills, update state |
+| Anytime (review) | `python plot_portfolio.py --metrics` | snapshot chart + quant metrics (read-only; values at the latest local bar) |
 
 You do not need to retrain every day — retrain periodically as new data accumulates, and never reuse test-set metrics for model selection.
 
@@ -315,6 +316,7 @@ All under `output/`:
 | `portfolio_state.paper.json` (+`.bak`) | Portfolio | paper/dry-run ledger: cash, positions, trade history, `processed_fill_ids` |
 | `portfolio_state.sim.json` (+`.bak`) | Portfolio | sim-mode ledger (isolated from paper) |
 | `daily_report.html` | Reporter | human-readable daily report |
+| `portfolio_chart.png` | `plot_portfolio.py` | snapshot chart: allocation, per-position P&L vs stop/target, equity summary, optional quant-metrics panel (`--metrics`) |
 | `run_log.csv` | `run_daily.py` | one row per pipeline run |
 
 `python/models/*.joblib` holds the trained models.

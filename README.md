@@ -88,6 +88,10 @@ python run_daily.py --mode ibkr_paper --confirm-paper-orders  # submit pre-marke
 python run_daily.py --mode ibkr_paper --confirm-paper-orders --market-hours  # immediate MKT orders during RTH
 python run_daily.py --reconcile-only                          # fetch fills, update state (idempotent)
 
+# Visualize the current portfolio (offline; values at the latest local bar)
+python plot_portfolio.py                                      # allocation + per-position P&L + equity summary
+python plot_portfolio.py --metrics                            # add a quant-metrics panel (exposure, risk, concentration)
+
 # Download / update price data
 python download_data.py           # default tickers
 python expand_universe.py         # 101-stock universe

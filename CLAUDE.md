@@ -50,6 +50,11 @@ python run_daily.py --reconcile-only                          # fetch fills, upd
 python ibkr_sync.py                                           # print broker state + diff vs local
 python ibkr_sync.py --apply --confirm                         # rebuild portfolio_state.paper.json from broker
 
+# Plot a portfolio snapshot (offline; values positions at the latest local bar)
+python plot_portfolio.py                                      # paper state -> output/portfolio_chart.png
+python plot_portfolio.py --metrics                            # add quant-metrics panel (exposure/risk/concentration)
+python plot_portfolio.py --mode sim --show                   # sim state, also open a window
+
 # Data
 python download_data.py           # default tickers / incremental refresh
 python expand_universe.py         # full 101-stock universe
@@ -84,6 +89,7 @@ There is no pytest setup. Tests are plain scripts with a `check(cond, msg)` harn
 - `run_daily.py` — the daily orchestrator (modes: `sim`, `ibkr_dry_run`, `ibkr_paper`, plus `--reconcile-only`).
 - `ibkr_sync.py` — read-only pull of live broker state (open orders/positions/account/fills) to sync machines sharing one paper account; `--apply --confirm` rebuilds `portfolio_state.paper.json` from broker truth. Never submits orders.
 - `feature_engine.py`, `predictor.py`, `order_generator.py`, `portfolio.py`, `reporter.py`, `download_data.py`.
+- `plot_portfolio.py` — read-only snapshot chart (allocation, per-position P&L vs stop/target, equity summary; `--metrics` adds an exposure/concentration/risk panel). Values positions at the latest local bar via `load_prices` (offline), reads `sim`/`paper` state by `--mode`, writes `output/portfolio_chart.png`. Never mutates state.
 - `execution/`:
   - `order.py` — `Order`, `Fill`, `OrderStatus`, `Action` (orders carry `broker_order_id` + `perm_id`)
   - `order_manager.py` — signal→order conversion, lifecycle logging
@@ -122,4 +128,4 @@ These are load-bearing. Changing them needs deliberate review.
 
 ## Output files (`output/`)
 
-`ml_dataset.csv`, `predictions*.csv`, `ml_metrics.csv`, `orders.csv`, `orders_lifecycle.csv` (incl. `broker_order_id`/`perm_id`), `fills.csv` (audit), `ibkr_order_log.csv`, `portfolio_state.{sim,paper}.json` (+`.bak`, incl. `processed_fill_ids`), `daily_report.html`, `run_log.csv`. Models live in `python/models/*.joblib`.
+`ml_dataset.csv`, `predictions*.csv`, `ml_metrics.csv`, `orders.csv`, `orders_lifecycle.csv` (incl. `broker_order_id`/`perm_id`), `fills.csv` (audit), `ibkr_order_log.csv`, `portfolio_state.{sim,paper}.json` (+`.bak`, incl. `processed_fill_ids`), `daily_report.html`, `portfolio_chart.png` (from `plot_portfolio.py`), `run_log.csv`. Models live in `python/models/*.joblib`.
