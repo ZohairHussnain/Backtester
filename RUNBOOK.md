@@ -215,13 +215,18 @@ Reconciliation is **idempotent and crash-safe**: each applied execution id is re
 
 ---
 
-## 9b. Syncing two machines on the same paper account
+## 9b. Adopting broker positions the local ledger doesn't know about (other machine **or** a manual TWS trade)
 
-If you run the strategy from more than one computer against the **same IBKR paper account**, each machine keeps its own local ledger (`portfolio_state.paper.json`) and per-machine logs (`orders_lifecycle.csv`, `fills.csv`). When laptop A submits and fills, laptop B's local ledger knows nothing about it.
+Two situations leave the broker holding a position your local ledger has never recorded:
 
-**`--reconcile-only` does not fix this**: it matches broker fills against the *local* `orders_lifecycle.csv` (by `perm_id`/`broker_order_id`). Laptop B never recorded laptop A's orders, so those fills are "unmatched" and skipped. The IBKR account itself is the shared source of truth.
+1. **Multiple machines on one paper account.** Each machine keeps its own local ledger (`portfolio_state.paper.json`) and per-machine logs (`orders_lifecycle.csv`, `fills.csv`). When laptop A submits and fills, laptop B's local ledger knows nothing about it.
+2. **A manual buy/sell you placed yourself in TWS / the IBKR app.** The pipeline never generated an order for it, so no local order row exists.
 
-`ibkr_sync.py` pulls that truth and can rebuild a machine's local paper ledger from it. The connection is **read-only** (`IBKRBroker(dry_run=True)` opens a read-only API session on the hardcoded paper port); it can never place or cancel an order.
+**`--reconcile-only` does not fix either case — by design.** It matches broker fills against the *local* `orders_lifecycle.csv` **ids-only** (`perm_id`, then `broker_order_id`). A fill with no matching local order — another machine's order, or your manual trade — is "unmatched" and deliberately skipped. (That same ids-only guard is what stops the account's whole `ib.fills()` execution history from corrupting fresh state — never loosen it to grab unmatched fills.) The IBKR account itself is the shared source of truth.
+
+`ibkr_sync.py --apply` is the supported way to pull that truth into the local ledger.
+
+It pulls that truth and rebuilds the local paper ledger from it. The connection is **read-only** (`IBKRBroker(dry_run=True)` opens a read-only API session on the hardcoded paper port); it can never place or cancel an order.
 
 ```powershell
 cd python
@@ -239,7 +244,9 @@ python ibkr_sync.py --apply --confirm
 
 `--apply` sets `open_positions` to the broker's actual STK holdings (shares + average cost), preserving each ticker's local `stop_price`/`target_price`/`entry_date` where it already exists locally. Cash is reconstructed from the strategy capital envelope (`IBKR_PAPER_STRATEGY_CAPITAL` + local realized P&L − open cost basis), **not** read from the auto-funded ~$1M paper balance. It writes only `portfolio_state.paper.json` (atomic, backed up) and never touches sim state.
 
-Caveats: the broker does not report stop/target or original entry date, so **broker-only** positions (opened on another machine) come back with today's date and zero stop/target — review them before the next run if exit logic matters. Realized-P&L history still lives per machine, so for fully consistent cash, prefer running `--reconcile-only` on the machine that *submitted* the orders and `ibkr_sync.py --apply --confirm` on the other.
+Caveats: the broker does not report stop/target or original entry date, so **broker-only** positions (opened on another machine or by a manual TWS trade) come back with today's date and **zero** stop/target (`--apply` preserves existing local levels but cannot invent missing ones). Run `python run_daily.py --reconcile-only` afterward to `backfill_exit_levels()` from the broker average cost so `determine_exits` can manage them — but note the **entry date is the sync date, not the true fill date**, so `MAX_HOLD_DAYS` is then measured from when you synced. Review adopted positions before the next run if exit timing matters. Realized-P&L history still lives per machine, so for fully consistent cash, prefer running `--reconcile-only` on the machine that *submitted* the orders and `ibkr_sync.py --apply --confirm` on the other.
+
+> If you routinely place manual trades alongside the bot and want them managed by `determine_exits` with a correct entry date, `ibkr_sync` is a coarse fit (it dates positions at the sync time and zeros their stop/target until a follow-up backfill). The cleaner long-term option is an opt-in "adopt unmatched fills" path in `--reconcile-only`, fenced so it only ever adopts *today's* unmatched executions via `processed_fill_ids` — not yet built.
 
 ---
 

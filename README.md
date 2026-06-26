@@ -41,7 +41,7 @@ A single daily command runs the whole flow:
 - `order_manager.py` — signal-to-order conversion with lifecycle tracking
 - `broker_adapter.py` — abstract `BrokerAdapter` + `SimulatedBroker`
 - `ibkr_broker.py` — paper-only IBKR via `ib_insync` (port 4002 hardcoded, paper account verified, integer shares, MOO or MKT)
-- `fill_reconciler.py` — matches broker fills to orders on stable `perm_id` (falls back to `broker_order_id`, then ticker+action); accumulates partial fills
+- `fill_reconciler.py` — matches broker fills to orders **ids-only** (stable `perm_id`, then submit-time `broker_order_id`); accumulates partial fills. There is deliberately **no** ticker/action fallback — a fill with no matching local order (another machine's order, or a manual TWS trade) is skipped, not adopted. Use `ibkr_sync.py --apply` to bring such broker positions into the local ledger
 - `portfolio.py` / `portfolio_manager.py` — state updated **only** from confirmed fills, at the exact broker price/commission; reconciliation is idempotent and crash-safe (`processed_fill_ids` committed atomically)
 
 ## Requirements
