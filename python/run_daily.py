@@ -346,9 +346,12 @@ def print_order_summary(orders, portfolio: Portfolio, broker) -> None:
         est_val = shares * _latest_close(o["ticker"])
         total_value += est_val if o.get("action") == "BUY" else 0
 
+        stop = o.get("stop_price") or 0.0
+        target = o.get("target_price") or 0.0
+        prob = o.get("probability") or 0.0
         print(f"  {o.get('action',''):<6} {o.get('ticker',''):<8} {shares:>8d} "
-              f"${est_val:>11,.2f} ${o.get('stop_price',0):>7.2f} "
-              f"${o.get('target_price',0):>7.2f} {o.get('probability',0):>5.4f}")
+              f"${est_val:>11,.2f} ${stop:>7.2f} "
+              f"${target:>7.2f} {prob:>5.4f}")
 
     print(f"\n  Total estimated new exposure: ${total_value:,.2f}")
     print(f"  Current positions + new:      {len(portfolio.open_positions) + len(orders[orders['action']=='BUY'])}")
